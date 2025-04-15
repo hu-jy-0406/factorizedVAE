@@ -2,6 +2,7 @@
 #   fast-DiT: https://github.com/chuanyangjin/fast-DiT/blob/main/train.py
 #   nanoGPT: https://github.com/karpathy/nanoGPT/blob/master/model.py
 import torch
+import torch.nn.functional as F
 # the first flag below was False when we tested this script but True makes A100 training a lot faster:
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -55,6 +56,9 @@ import warnings
 warnings.filterwarnings('ignore')
 
 import wandb
+os.environ["WANDB_MODE"] = "disabled"
+
+import matplotlib.pyplot as plt
 #################################################################################
 #                                  Training Loop                                #
 #################################################################################
@@ -67,10 +71,15 @@ def get_random_ratio(randomness_anneal_start, randomness_anneal_end, end_ratio, 
     else:
         return 1.0 - (cur_step - randomness_anneal_start) / (randomness_anneal_end - randomness_anneal_start) * end_ratio
 
+def log_time(logger, name, time_list):
+        total_time = sum(time_list)
+        avg_time = total_time / len(time_list)
+        logger.info(f"{name} time: [Average: {avg_time:.4f} seconds; Total: {total_time:.4f} seconds]")
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-path", type=str, default='/mnt/localssd/ImageNet2012/train')
+    #parser.add_argument("--data-path", type=str, default='/mnt/localssd/ImageNet2012/train')
+    parser.add_argument("--data-path", type=str, default='/home/hjy22/repos/CIFAR10')
     parser.add_argument("--data-face-path", type=str, default=None, help="face datasets to improve vq model")
     parser.add_argument("--cloud-save-path", type=str, default='output/debug', help='please specify a cloud disk path, if not, local path')
     parser.add_argument("--no-local-save", action='store_true', help='no save checkpoints to local path for limited disk volume')
@@ -97,7 +106,7 @@ def parse_args():
     parser.add_argument("--dropout-p", type=float, default=0.0, help="dropout_p")
     parser.add_argument("--results-dir", type=str, default="results_tokenizer_image")
     parser.add_argument("--dataset", type=str, default='imagenet')
-    parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
+    parser.add_argument("--image-size", type=int, choices=[256, 512], default=32)
     parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--disc_lr", type=float, default=1e-4)
@@ -179,6 +188,16 @@ def main(args):
     """
     Trains a new model.
     """
+
+    # export MASTER_ADDR=localhost
+    # export MASTER_PORT=29500
+    # export WORLD_SIZE=1
+    # export RANK=0
+    # export LOCAL_RANK=0
+    # export TORCH_DISTRIBUTED_DEBUG=DETAIL
+    # python tokenizer/tokenizer_image/xqgan_train.py --config /home/hjy22/repos/ImageFolder/configs/VQ-8192.yaml
+
+
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
 
     # Setup DDP:
@@ -188,6 +207,10 @@ def main(args):
     device = rank % torch.cuda.device_count()
     seed = args.global_seed * dist.get_world_size() + rank
     torch.manual_seed(seed)
+    # rank = 0
+    # device = 0
+    # seed = args.global_seed
+    # torch.manual_seed(seed)
     torch.cuda.set_device(device)
 
     # Setup an experiment folder:
@@ -221,9 +244,18 @@ def main(args):
     # training env
     logger.info(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
 
-    # Setup data:
+    # # Setup data:
+    # transform = transforms.Compose([
+    #     transforms.Lambda(lambda pil_image: random_crop_arr(pil_image, args.image_size)),
+    #     transforms.RandomHorizontalFlip(),
+    #     transforms.ToTensor(),
+    #     transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
+    # ])
+
+    #use cifar10 dataset
     transform = transforms.Compose([
-        transforms.Lambda(lambda pil_image: random_crop_arr(pil_image, args.image_size)),
+        #upsample the images from 32*32 to 256*256
+        # transforms.Resize((args.image_size, args.image_size)),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
@@ -317,39 +349,64 @@ def main(args):
         requires_grad(ema, False)
         logger.info(f"VQ Model EMA Parameters: {sum(p.numel() for p in ema.parameters()):,}")
     vq_model = vq_model.to(device)
-    vq_loss = VQLoss(
-        disc_start=args.disc_start, 
-        disc_weight=args.disc_weight,
-        disc_type=args.disc_type,
-        disc_loss=args.disc_loss,
-        gen_adv_loss=args.gen_loss,
-        image_size=args.image_size,
-        perceptual_weight=args.perceptual_weight,
-        reconstruction_weight=args.reconstruction_weight,
-        reconstruction_loss=args.reconstruction_loss,
-        codebook_weight=args.codebook_weight,
-        lecam_loss_weight=args.lecam_loss_weight,
-        disc_adaptive_weight=args.disc_adaptive_weight,
-        norm_type=args.norm_type,
-        aug_prob=args.aug_prob,
-    ).to(device)
-    logger.info(f"Discriminator Parameters: {sum(p.numel() for p in vq_loss.discriminator.parameters()):,}")
+
+    #only use simple loss in the first simple version
+    if args.enc_type != 'simple':
+        vq_loss = VQLoss(
+            disc_start=args.disc_start, 
+            disc_weight=args.disc_weight,
+            disc_type=args.disc_type,
+            disc_loss=args.disc_loss,
+            gen_adv_loss=args.gen_loss,
+            image_size=args.image_size,
+            perceptual_weight=args.perceptual_weight,
+            reconstruction_weight=args.reconstruction_weight,
+            reconstruction_loss=args.reconstruction_loss,
+            codebook_weight=args.codebook_weight,
+            lecam_loss_weight=args.lecam_loss_weight,
+            disc_adaptive_weight=args.disc_adaptive_weight,
+            norm_type=args.norm_type,
+            aug_prob=args.aug_prob,
+        ).to(device)
+        logger.info(f"Discriminator Parameters: {sum(p.numel() for p in vq_loss.discriminator.parameters()):,}")
+        vq_loss = DDP(vq_loss.to(device), device_ids=[args.gpu])
+        vq_loss.train()
+        args.disc_lr = args.disc_lr * args.global_batch_size / 128
+        scaler_disc = torch.cuda.amp.GradScaler(enabled=(args.mixed_precision =='fp16'))
+        optimizer_disc = torch.optim.AdamW(vq_loss.discriminator.parameters(), lr=args.disc_lr,
+                                       betas=(args.beta1, args.beta2), weight_decay=args.disc_weight_decay, )
+        if args.lr_scheduler == 'none':
+            disc_lr_scheduler = None
+        else:
+            disc_lr_scheduler, _ = create_scheduler(
+            sched=args.lr_scheduler,
+            optimizer=optimizer_disc,
+            patience_epochs=0,
+            step_on_epochs=True,
+            updates_per_epoch=num_update_steps_per_epoch,
+            num_epochs=args.epochs - args.disc_epoch_start,
+            warmup_epochs=int(0.02 * args.epochs),
+            min_lr=5e-5,
+        )
+    else:
+        vq_loss = None
+        optimizer_disc = None
+        scaler_disc = None
+        disc_lr_scheduler = None
+        logger.info("No discriminator training")
 
     args.lr = args.lr * args.global_batch_size / 128
-    args.disc_lr = args.disc_lr * args.global_batch_size / 128
+    
     # initialize a GradScaler. If enabled=False scaler is a no-op
     scaler = torch.cuda.amp.GradScaler(enabled=(args.mixed_precision =='fp16'))
-    scaler_disc = torch.cuda.amp.GradScaler(enabled=(args.mixed_precision =='fp16'))
+    
     # Setup optimizer
     optimizer = torch.optim.AdamW(vq_model.parameters(), lr=args.lr, betas=(args.beta1, args.beta2),
                                   weight_decay=args.weight_decay, )
-    optimizer_disc = torch.optim.AdamW(vq_loss.discriminator.parameters(), lr=args.disc_lr,
-                                       betas=(args.beta1, args.beta2), weight_decay=args.disc_weight_decay, )
-
+    
     # create lr scheduler
     if args.lr_scheduler == 'none':
         vqvae_lr_scheduler = None
-        disc_lr_scheduler = None
     else:
         vqvae_lr_scheduler, _ = create_scheduler(
             sched=args.lr_scheduler,
@@ -361,18 +418,10 @@ def main(args):
             warmup_epochs=1,
             min_lr=5e-5,
         )
-        disc_lr_scheduler, _ = create_scheduler(
-            sched=args.lr_scheduler,
-            optimizer=optimizer_disc,
-            patience_epochs=0,
-            step_on_epochs=True,
-            updates_per_epoch=num_update_steps_per_epoch,
-            num_epochs=args.epochs - args.disc_epoch_start,
-            warmup_epochs=int(0.02 * args.epochs),
-            min_lr=5e-5,
-        )
+        
 
     logger.info(f"num_update_steps_per_epoch {num_update_steps_per_epoch:,} max_train_steps ({max_train_steps})")
+    print(f"num_update_steps_per_epoch {num_update_steps_per_epoch:,} max_train_steps ({max_train_steps})")
 
     # Prepare models for training:
     if args.vq_ckpt:
@@ -409,12 +458,11 @@ def main(args):
         logger.info("compiling the model... (may take several minutes)")
         vq_model = torch.compile(vq_model, mode='max-autotune')  # requires PyTorch 2.0
     
-    vq_model = DDP(vq_model.to(device), device_ids=[args.gpu])
+    vq_model = DDP(vq_model.to(device), device_ids=[args.gpu], find_unused_parameters=True)
     vq_model.train()
     if args.ema:
         ema.eval()  # EMA model should always be in eval mode
-    vq_loss = DDP(vq_loss.to(device), device_ids=[args.gpu])
-    vq_loss.train()
+    
 
     ptdtype = {'none': torch.float32, 'bf16': torch.bfloat16, 'fp16': torch.float16}[args.mixed_precision]
 
@@ -425,7 +473,22 @@ def main(args):
     curr_fid = None
 
     logger.info(f"Training for {args.epochs} epochs...")
-    for epoch in range(start_epoch, args.epochs):
+    
+    model_time = []
+    model_enc_time = []
+    model_quant_time = []
+    model_dec_time = []
+    model_sem_time = []
+    model_detail_time = []
+    loss_comb_time = []
+    backward_time = []
+    optimizer_time = []
+    discriminator_time = []
+    iteration_time = []
+
+    for epoch in tqdm(range(start_epoch, args.epochs)):
+        #calculate each epoch's running time
+        epoch_start_time = time.time()
         ratio = get_random_ratio(args.anneal_start, args.anneal_end, args.end_ratio, epoch)
         delta = int(ratio * args.delta)
         alpha = ratio * args.alpha
@@ -436,7 +499,9 @@ def main(args):
         if args.disc_reinit != 0:
             if epoch % args.disc_reinit == 0:
                 vq_loss.module.discriminator.reinit()
-        for x, y in loader:
+        for x, y in tqdm(loader):
+            iteration_start_time = time.time()
+
             imgs = x.to(device, non_blocking=True)
 
             if args.aug_fade_steps >= 0:
@@ -446,13 +511,39 @@ def main(args):
                 fade_blur_schedule = 0
             # generator training
             optimizer.zero_grad()
+            model_start_time = time.time()
             with torch.cuda.amp.autocast(dtype=ptdtype):  
-                recons_imgs, codebook_loss, sem_loss, detail_loss, dependency_loss = vq_model(imgs, epoch, alpha, beta, delta)
-                loss_gen = vq_loss(codebook_loss, sem_loss, detail_loss, dependency_loss, imgs, recons_imgs, optimizer_idx=0, global_step=train_steps+1,
+                #calculate the time cost of the forward process
+                
+                recons_imgs, codebook_loss, sem_loss, detail_loss, dependency_loss, times = vq_model(imgs, epoch, alpha, beta, delta)
+                
+                model_enc_time.append(times[0])
+                model_quant_time.append(times[1])
+                model_dec_time.append(times[2])
+                model_sem_time.append(times[3])
+                model_detail_time.append(times[4])
+
+                loss_comb_start_time = time.time()
+                if args.enc_type != 'simple':
+                    loss_gen = vq_loss(codebook_loss, sem_loss, detail_loss, dependency_loss, imgs, recons_imgs, optimizer_idx=0, global_step=train_steps+1,
                                    last_layer=vq_model.module.decoder.last_layer, 
                                    logger=logger, log_every=args.log_every, fade_blur_schedule=fade_blur_schedule)
+                else:
+                    rec_loss = F.mse_loss(imgs.contiguous(), recons_imgs.contiguous())
+                    loss_gen = rec_loss + codebook_loss[0] + codebook_loss[1] + codebook_loss[2] 
+                loss_comb_end_time = time.time()
+                loss_comb_time.append(loss_comb_end_time - loss_comb_start_time)
 
+            backward_start_time = time.time()
             scaler.scale(loss_gen).backward()
+            backward_end_time = time.time()
+            backward_time.append(backward_end_time - backward_start_time)
+
+            model_end_time = time.time()
+            model_time.append(model_end_time - model_start_time)
+
+            # calculate the time cost of the optimizer
+            optimizer_start_time = time.time()
             if args.max_grad_norm != 0.0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(vq_model.parameters(), args.max_grad_norm)
@@ -460,22 +551,30 @@ def main(args):
             scaler.update()
             if args.ema:
                 update_ema(ema, vq_model.module._orig_mod if args.compile else vq_model.module)
+            optimizer_end_time = time.time()
+            optimizer_time.append(optimizer_end_time - optimizer_start_time)
 
-            # discriminator training            
-            optimizer_disc.zero_grad()
+            # discriminator training
+            discriminator_start_time = time.time()
+            if args.enc_type != 'simple':
+                optimizer_disc.zero_grad()
 
-            with torch.cuda.amp.autocast(dtype=ptdtype):
-                loss_disc = vq_loss(codebook_loss, sem_loss, detail_loss, dependency_loss, imgs, recons_imgs, optimizer_idx=1, global_step=train_steps+1,
-                                    logger=logger, log_every=args.log_every, fade_blur_schedule=fade_blur_schedule)
-            scaler_disc.scale(loss_disc).backward()
-            if args.max_grad_norm != 0.0:
-                scaler_disc.unscale_(optimizer_disc)
-                torch.nn.utils.clip_grad_norm_(vq_loss.module.discriminator.parameters(), args.max_grad_norm)
-            scaler_disc.step(optimizer_disc)
-            scaler_disc.update()
-            
+                with torch.cuda.amp.autocast(dtype=ptdtype):
+                    loss_disc = vq_loss(codebook_loss, sem_loss, detail_loss, dependency_loss, imgs, recons_imgs, optimizer_idx=1, global_step=train_steps+1,
+                                        logger=logger, log_every=args.log_every, fade_blur_schedule=fade_blur_schedule)
+                scaler_disc.scale(loss_disc).backward()
+                if args.max_grad_norm != 0.0:
+                    scaler_disc.unscale_(optimizer_disc)
+                    torch.nn.utils.clip_grad_norm_(vq_loss.module.discriminator.parameters(), args.max_grad_norm)
+                scaler_disc.step(optimizer_disc)
+                scaler_disc.update()
+                running_loss += loss_disc.item()
+
+            discriminator_end_time = time.time()
+            discriminator_time.append(discriminator_end_time - discriminator_start_time)
+
             # # Log loss values:
-            running_loss += loss_gen.item() + loss_disc.item()
+            running_loss += loss_gen.item()
             
             log_steps += 1
             train_steps += 1
@@ -512,7 +611,7 @@ def main(args):
 
                         vq_loss.module.wandb_tracker.log({"recon_images": [wandb.Image(image)]}, step=train_steps)
 
-            # Save checkpoint:
+            #Save checkpoint:
             if train_steps % args.ckpt_every == 0 and train_steps > 0:
                 if args.save_best:
                     vq_model.eval()
@@ -607,10 +706,78 @@ def main(args):
 
                 dist.barrier()
 
+            iteration_end_time = time.time()
+            iteration_time.append(iteration_end_time - iteration_start_time)
+
+
+
         if vqvae_lr_scheduler is not None:
             vqvae_lr_scheduler.step(epoch + 1)
         if disc_lr_scheduler is not None and epoch >= args.disc_epoch_start:
             disc_lr_scheduler.step(epoch + 1 - args.disc_epoch_start)
+        epoch_end_time = time.time()
+        epoch_duration = epoch_end_time - epoch_start_time
+        epoch_duration_str = time.strftime("%H:%M:%S", time.gmtime(epoch_duration))
+        logger.info(f"Epoch {epoch} finished in {epoch_duration_str}.")
+
+
+        log_time(logger, 'model', model_time)
+        log_time(logger, 'model_enc', model_enc_time)
+        log_time(logger, 'model_quant', model_quant_time)
+        log_time(logger, 'model_dec', model_dec_time)
+        log_time(logger, 'model_sem', model_sem_time)
+        log_time(logger, 'model_detail', model_detail_time)
+        log_time(logger, 'loss_comb', loss_comb_time)
+        log_time(logger, 'backward', backward_time)
+        log_time(logger, 'optimizer', optimizer_time)
+        log_time(logger, 'discriminator', discriminator_time)
+        log_time(logger, 'iteration', iteration_time)
+
+
+    # total_model_time = sum(model_time)
+    # avg_model_time = total_model_time / len(model_time)
+    # logger.info(f"Average model time: {avg_model_time:.4f} seconds")
+    # logger.info(f"Total model time: {total_model_time:.4f} seconds")
+
+
+
+    # total_optimizer_time = sum(optimizer_time)
+    # avg_optimizer_time = total_optimizer_time / len(optimizer_time)
+    # logger.info(f"Average optimizer time: {avg_optimizer_time:.4f} seconds")
+    # logger.info(f"Total optimizer time: {total_optimizer_time:.4f} seconds")
+
+    # total_discriminator_time = sum(discriminator_time)
+    # avg_discriminator_time = total_discriminator_time / len(discriminator_time)
+    # logger.info(f"Average discriminator time: {avg_discriminator_time:.4f} seconds")
+    # logger.info(f"Total discriminator time: {total_discriminator_time:.4f} seconds")
+
+    # total_iteration_time = sum(iteration_time)
+    # avg_iteration_time = total_iteration_time / len(iteration_time)
+    # logger.info(f"Average iteration time: {avg_iteration_time:.4f} seconds")
+    # logger.info(f"Total iteration time: {total_iteration_time:.4f} seconds")
+
+    
+    #draw the curve of the forward_time and iteration_time with the x axis as the iteration step
+    # Generate x-axis values (iteration steps)
+    iteration_steps = list(range(1, len(model_time) + 1))
+
+    # # Plot forward_time
+    # plt.figure(figsize=(10, 6))
+    # plt.plot(iteration_steps, forward_time, label="Forward Time", color="blue", linewidth=1.5)
+
+    # # Plot iteration_time
+    # plt.plot(iteration_steps, iteration_time, label="Iteration Time", color="orange", linewidth=1.5)
+
+    # # Add labels, title, and legend
+    # plt.xlabel("Iteration Step", fontsize=12)
+    # plt.ylabel("Time (seconds)", fontsize=12)
+    # plt.title("Forward Time and Iteration Time per Iteration Step", fontsize=14)
+    # plt.legend(fontsize=12)
+    # plt.grid(alpha=0.3)
+
+    # # Save the plot as an image or display it
+    # plt.savefig("time_curve.png")  # Save the plot as a PNG file
+    # # plt.show()  # Display the plot
 
     vq_model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...

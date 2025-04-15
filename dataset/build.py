@@ -3,6 +3,7 @@ from dataset.coco import build_coco
 from dataset.openimage import build_openimage
 from dataset.pexels import build_pexels
 from dataset.t2i import build_t2i, build_t2i_code, build_t2i_image
+from dataset.cifar10 import build_cifar10
 
 
 def build_dataset(args, **kwargs):
@@ -23,5 +24,7 @@ def build_dataset(args, **kwargs):
         return build_t2i(args, **kwargs)
     if args.dataset == 't2i_code':
         return build_t2i_code(args, **kwargs)
+    if args.dataset == 'cifar10':
+        return build_cifar10(args, **kwargs)
     
     raise ValueError(f'dataset {args.dataset} is not supported')

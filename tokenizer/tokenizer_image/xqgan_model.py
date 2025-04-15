@@ -22,10 +22,14 @@ from tokenizer.tokenizer_image.quant import VectorQuantizer2
 from tokenizer.tokenizer_image.lookup_free_quantize import LFQ
 from tokenizer.tokenizer_image.dino_enc.dinov2 import DINOv2Encoder, DINOv2Decoder
 from tokenizer.tokenizer_image.latent_perturbation import add_perturbation
+from vqvae_simple.encoder import Encoder_Simple
+from vqvae_simple.decoder import Decoder_Simple
 from datasets import Denormalize
 from datasets import Normalize as ImgNormalize
 
 import torch.distributed as tdist
+
+import time
 
 @dataclass
 class ModelArgs:
@@ -99,8 +103,11 @@ class VQModel(nn.Module):
                 product_quant=config.product_quant,
             )
             self.quant_conv = nn.Conv2d(self.encoder.embed_dim, config.codebook_embed_dim, 1)
+        elif config.enc_type == 'simple':
+            self.encoder = Encoder_Simple(in_dim=3, h_dim=config.z_channels, n_res_layers=2, res_h_dim=32)
+            self.quant_conv = nn.Conv2d(config.z_channels, config.codebook_embed_dim, 1)
         else:
-            raise NotImplementedError
+            raise NotImplementedError(f"Encoder type {config.enc_type} not implemented")
 
         if config.dec_type == 'cnn':
             self.decoder = Decoder(ch_mult=config.decoder_ch_mult, z_channels=config.z_channels, dropout=config.dropout_p)
@@ -119,6 +126,9 @@ class VQModel(nn.Module):
                 abs_pos_embed=config.abs_pos_embed,
             )
             self.post_quant_conv = nn.Conv2d(config.codebook_embed_dim, self.decoder.embed_dim, 1)
+        elif config.dec_type == 'simple':
+            self.decoder = Decoder_Simple(in_dim=config.z_channels, h_dim=config.z_channels, n_res_layers=2, res_h_dim=32)
+            self.post_quant_conv = nn.Conv2d(config.codebook_embed_dim, config.z_channels, 1)
 
         self.V = self.vocab_size = config.codebook_size * self.product_quant
         self.Cvae = config.codebook_embed_dim * self.product_quant
@@ -201,6 +211,8 @@ class VQModel(nn.Module):
                 self.sem_linear = nn.Conv2d(768, config.codebook_embed_dim//2, 1)
             if self.enc_type == 'cnn':
                 self.sem_linear = torch.nn.Linear(384, config.codebook_embed_dim)
+            elif self.enc_type == 'simple':
+                self.sem_linear = torch.nn.Linear(config.z_channels, config.codebook_embed_dim)
 
             self.sem_loss_weight = config.sem_loss_weight
         
@@ -266,13 +278,15 @@ class VQModel(nn.Module):
         return dec
 
     def forward(self, input, epoch, alpha, beta, delta):
+        model_enc_time_start = time.time()
         h = self.encode(input)
+        model_enc_time = time.time() - model_enc_time_start
         b, c, l, _ = h.shape
         if len(self.v_patch_nums) == 1:
             dropout_rand = None
         else:
             dropout_rand = torch.randint(self.start_drop, len(self.v_patch_nums) + 1, (b,))  # to fix dropout across quantizers, skip first start_drop-1 quantizers
-
+        model_quant_time_start = time.time()
         if self.product_quant > 1:
             h_list = h.chunk(chunks=self.product_quant, dim=2)
             quant_list, usages_list, mean_vq_loss_list, commit_loss_list, entropy_list = [], [], [], [], []
@@ -293,15 +307,18 @@ class VQModel(nn.Module):
         else:
             dependency_loss = 0.0
             quant, usages, mean_vq_loss, mean_commit_loss, mean_entropy = self.quantize.forward(h, ret_usages=True, dropout=dropout_rand)
-            print(alpha, beta, delta)
+            #print(alpha, beta, delta)
             quant = add_perturbation(h, quant, self.quantize.z_channels, self.quantize.codebook_norm, self.quantize.embedding, alpha, beta, delta)
             quant_list = [quant]
+        model_quant_time = time.time() - model_quant_time_start
 
-
+        model_dec_time_start = time.time()
         dec = self.decode(quant)
+        model_dec_time = time.time() - model_dec_time_start
 
         # normalize the inputs to dino's transform
         input = self.normalize(self.denormalize(input))
+        model_sem_time_start = time.time()
         if self.semantic_guide != 'none':
             if self.guide_type_1 == 'class':
                 z_s = self.semantic_model(input)
@@ -315,6 +332,9 @@ class VQModel(nn.Module):
                 z_s = torch.mean(z_s, dim=(2, 3)).contiguous()
                 z_q_ = torch.mean(semantic_quant, dim=(2, 3)).contiguous()
             elif self.enc_type == 'cnn':
+                z_q_ = torch.mean(h, dim=(2, 3)).contiguous()
+                z_s = self.sem_linear(z_s).contiguous()
+            elif self.enc_type == 'simple':
                 z_q_ = torch.mean(h, dim=(2, 3)).contiguous()
                 z_s = self.sem_linear(z_s).contiguous()
 
@@ -331,7 +351,9 @@ class VQModel(nn.Module):
                 sem_loss = sem_loss * self.sem_loss_weight
         else:
             sem_loss = None
-        
+        model_sem_time = time.time() - model_sem_time_start
+
+        model_detail_time_start = time.time()        
         if self.detail_guide != 'none':
             assert self.guide_type_2 == 'patch', "current only accept patch for detail guide"
             if self.guide_type_2 == 'class':
@@ -361,8 +383,9 @@ class VQModel(nn.Module):
                 detail_loss = detail_loss * self.detail_loss_weight
         else:
             detail_loss = None
+        model_detail_time = time.time() - model_detail_time_start
 
-        return dec, (mean_vq_loss, mean_commit_loss, mean_entropy, usages), sem_loss, detail_loss, dependency_loss
+        return dec, (mean_vq_loss, mean_commit_loss, mean_entropy, usages), sem_loss, detail_loss, dependency_loss, (model_enc_time, model_quant_time, model_dec_time, model_sem_time, model_detail_time)
 
     def img_to_reconstructed_img(self, x, last_one=True,) -> List[torch.Tensor]:
         h = self.encoder(x)
