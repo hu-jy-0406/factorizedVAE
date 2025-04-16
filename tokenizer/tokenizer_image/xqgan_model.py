@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from tokenizer.vqgan.cliploss import ClipLoss
+from tokenizer.tokenizer_image.diffloss import DiffLoss
 from timm.models import create_model
 
 import sys, os
@@ -75,6 +76,8 @@ class ModelArgs:
 
     test_model: bool = False
 
+    use_diffloss: bool = False
+
 
 class VQModel(nn.Module):
     def __init__(self, config: ModelArgs,):
@@ -87,6 +90,7 @@ class VQModel(nn.Module):
         self.start_drop = config.start_drop
         self.clip_norm = config.clip_norm
         config.num_latent_tokens = config.num_latent_tokens * config.product_quant  # scale num_latent_tokens for PQ
+        self.use_diffloss = config.use_diffloss
 
         if config.enc_type == 'cnn':
             self.encoder = Encoder(ch_mult=config.encoder_ch_mult, z_channels=config.z_channels, dropout=config.dropout_p)
@@ -245,6 +249,17 @@ class VQModel(nn.Module):
         if self.test_mode:
             self.eval()
             [p.requires_grad_(False) for p in self.parameters()]
+
+        if self.use_diffloss:
+            self.diffloss = DiffLoss(
+                target_channels=config.codebook_embed_dim,
+                z_channels=config.codebook_embed_dim,
+                width=config.codebook_embed_dim,
+                depth=3,
+                num_sampling_steps='100',
+                grad_checkpointing=False
+            )
+            self.diffusion_batch_mul = 4
     
     def finetune(self, enc_tuning_method, dec_tuning_method):
         self.encoder.finetine(enc_tuning_method)
@@ -277,6 +292,13 @@ class VQModel(nn.Module):
         dec = self.decode(quant_b)
         return dec
 
+    def forward_loss(self, z, target):
+        bsz, seq_len, _ = target.shape
+        target = target.reshape(bsz * seq_len, -1).repeat(self.diffusion_batch_mul, 1)
+        z = z.reshape(bsz*seq_len, -1).repeat(self.diffusion_batch_mul, 1)
+        loss = self.diffloss(z=z, target=target, mask=None)
+        return loss
+    
     def forward(self, input, epoch, alpha, beta, delta):
         model_enc_time_start = time.time()
         h = self.encode(input)
@@ -308,13 +330,27 @@ class VQModel(nn.Module):
             dependency_loss = 0.0
             quant, usages, mean_vq_loss, mean_commit_loss, mean_entropy = self.quantize.forward(h, ret_usages=True, dropout=dropout_rand)
             #print(alpha, beta, delta)
-            quant = add_perturbation(h, quant, self.quantize.z_channels, self.quantize.codebook_norm, self.quantize.embedding, alpha, beta, delta)
+            #quant = add_perturbation(h, quant, self.quantize.z_channels, self.quantize.codebook_norm, self.quantize.embedding, alpha, beta, delta)
             quant_list = [quant]
         model_quant_time = time.time() - model_quant_time_start
 
         model_dec_time_start = time.time()
         dec = self.decode(quant)
         model_dec_time = time.time() - model_dec_time_start
+
+        #calculate the diffusion loss
+        gt_latents = h.clone().detach()
+        if self.use_diffloss:
+            #reshape quant from (b, c, l, _) to (b, l, c)
+            quant = quant.permute(0, 2, 1, 3).reshape(b, l*l, -1)
+            #reshape gt_latents from (b, c, l, _) to (b, l, c)
+            gt_latents = gt_latents.permute(0, 2, 1, 3).reshape(b, l*l, -1)
+            #z_channels = 32, target_channels = 32
+            diff_loss = self.forward_loss(z=quant, target=gt_latents)
+            #print("diff_loss: ", diff_loss)
+            model_sem_time = 0
+            model_detail_time = 0
+            return dec, quant, (mean_vq_loss, mean_commit_loss, mean_entropy, usages), None, None, dependency_loss, diff_loss, (model_enc_time, model_quant_time, model_dec_time, model_sem_time, model_detail_time)
 
         # normalize the inputs to dino's transform
         input = self.normalize(self.denormalize(input))
@@ -385,7 +421,7 @@ class VQModel(nn.Module):
             detail_loss = None
         model_detail_time = time.time() - model_detail_time_start
 
-        return dec, (mean_vq_loss, mean_commit_loss, mean_entropy, usages), sem_loss, detail_loss, dependency_loss, (model_enc_time, model_quant_time, model_dec_time, model_sem_time, model_detail_time)
+        return dec, quant, (mean_vq_loss, mean_commit_loss, mean_entropy, usages), sem_loss, detail_loss, dependency_loss, None, (model_enc_time, model_quant_time, model_dec_time, model_sem_time, model_detail_time)
 
     def img_to_reconstructed_img(self, x, last_one=True,) -> List[torch.Tensor]:
         h = self.encoder(x)

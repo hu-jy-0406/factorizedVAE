@@ -1,4 +1,4 @@
-data_path: /home/hjy22/repos/CIFAR10
+data_path: /home/hjy22/repos/CIFAR10/val
 data_face_path:
 cloud_save_path: XQGAN-8192-simple-cifar10
 no_local_save: false
@@ -18,7 +18,7 @@ perceptual_weight: 1.0
 disc_weight: 0.5
 disc_epoch_start: 0
 disc_start: 0
-disc_type: dinodisc
+disc_type: none
 disc_loss: hinge
 gen_loss: hinge
 compile: false
@@ -26,7 +26,7 @@ dropout_p: 0.0
 results_dir: results_tokenizer_image
 dataset: cifar10
 image_size: 256
-epochs: 1
+epochs: 300
 lr: 3e-5
 disc_lr: 0.0001
 max_grad_norm: 0.0
@@ -38,13 +38,13 @@ beta2: 0.95
 global_batch_size: 32
 global_seed: 0
 num_workers: 16
-log_every: 10000
-vis_every: 10000
+log_every: 1000
+vis_every: 150000
 ckpt_every: 10000
 gradient_accumulation_steps: 1
 mixed_precision: bf16
 save_best: true
-val_data_path: /home/hjy22/repos/CIFAR10
+val_data_path: /home/hjy22/repos/CIFAR10/val
 sample_folder_dir: samples
 reconstruction_folder_dir: reconstruction
 v_patch_nums: [16]
@@ -80,11 +80,17 @@ guide_type_1: class
 guide_type_2: class
 lfq: false
 end_ratio: 0.5
-anneal_start: 200
+anneal_start: 100
 anneal_end: 200
 alpha: 0.0
 beta: 0.0
 delta: 100
+use_diffloss: false
+use_perceptual_loss: false
+use_disc_loss: false
+use_lecam_loss: false
+use_semantic_loss: false
+use_detail_loss: false
 rank: 0
 world_size: 1
 gpu: 0

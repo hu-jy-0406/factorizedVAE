@@ -41,6 +41,7 @@ from dataset.augmentation import random_crop_arr, center_crop_arr
 from dataset.build import build_dataset
 from tokenizer.tokenizer_image.xqgan_model import VQ_models
 from tokenizer.tokenizer_image.vq_loss import VQLoss
+#from tokenizer.tokenizer_image.diffloss import DiffLoss
 
 from timm.scheduler import create_scheduler_v2 as create_scheduler
 
@@ -56,7 +57,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 import wandb
-os.environ["WANDB_MODE"] = "disabled"
+#os.environ["WANDB_MODE"] = "disabled"
 
 import matplotlib.pyplot as plt
 #################################################################################
@@ -166,13 +167,17 @@ def parse_args():
     parser.add_argument("--lfq", action='store_true', default=False, help="if use LFQ")
 
     parser.add_argument("--end-ratio", type=float, default=0.5)
-    parser.add_argument("--anneal-start", type=int, default=200)
+    parser.add_argument("--anneal-start", type=int, default=100)
     parser.add_argument("--anneal-end", type=int, default=200)
     
     parser.add_argument("--alpha", type=float, default=0.0)
     parser.add_argument("--beta", type=float, default=0.0)
     parser.add_argument("--delta", type=int, default=100)
-
+    parser.add_argument("--use_diffloss", action='store_true', default=False, help="if use diffloss")
+    parser.add_argument("--use_perceptual_loss", action='store_true', default=False, help="if use perceptual loss")
+    parser.add_argument("--use_disc_loss", action='store_true', default=False, help="if use discriminator loss")
+    parser.add_argument("--use_lecam_loss", action='store_true', default=False, help="if use lecam loss")
+    
     args = parser.parse_args()
     if args.config is not None:
         with open(args.config, 'r', encoding='utf-8') as f:
@@ -341,7 +346,8 @@ def main(args):
         detail_loss_scale=args.detail_loss_scale,
         guide_type_1=args.guide_type_1,
         guide_type_2=args.guide_type_2,
-        lfq=args.lfq
+        lfq=args.lfq,
+        use_diffloss=args.use_diffloss
     )
     logger.info(f"VQ Model Parameters: {sum(p.numel() for p in vq_model.parameters()):,}")
     if args.ema:
@@ -350,24 +356,31 @@ def main(args):
         logger.info(f"VQ Model EMA Parameters: {sum(p.numel() for p in ema.parameters()):,}")
     vq_model = vq_model.to(device)
 
-    #only use simple loss in the first simple version
-    if args.enc_type != 'simple':
-        vq_loss = VQLoss(
-            disc_start=args.disc_start, 
-            disc_weight=args.disc_weight,
-            disc_type=args.disc_type,
-            disc_loss=args.disc_loss,
-            gen_adv_loss=args.gen_loss,
-            image_size=args.image_size,
-            perceptual_weight=args.perceptual_weight,
-            reconstruction_weight=args.reconstruction_weight,
-            reconstruction_loss=args.reconstruction_loss,
-            codebook_weight=args.codebook_weight,
-            lecam_loss_weight=args.lecam_loss_weight,
-            disc_adaptive_weight=args.disc_adaptive_weight,
-            norm_type=args.norm_type,
-            aug_prob=args.aug_prob,
-        ).to(device)
+
+    vq_loss = VQLoss(
+        disc_start=args.disc_start, 
+        disc_weight=args.disc_weight,
+        disc_type=args.disc_type,
+        disc_loss=args.disc_loss,
+        gen_adv_loss=args.gen_loss,
+        image_size=args.image_size,
+        perceptual_weight=args.perceptual_weight,
+        reconstruction_weight=args.reconstruction_weight,
+        reconstruction_loss=args.reconstruction_loss,
+        codebook_weight=args.codebook_weight,
+        lecam_loss_weight=args.lecam_loss_weight,
+        disc_adaptive_weight=args.disc_adaptive_weight,
+        norm_type=args.norm_type,
+        aug_prob=args.aug_prob,
+        use_diffloss=args.use_diffloss,
+        use_perceptual_loss=args.use_perceptual_loss,
+        use_disc_loss=args.use_disc_loss,
+        use_lecam_loss=args.use_lecam_loss
+        
+    ).to(device)
+    
+    
+    if args.use_disc_loss:
         logger.info(f"Discriminator Parameters: {sum(p.numel() for p in vq_loss.discriminator.parameters()):,}")
         vq_loss = DDP(vq_loss.to(device), device_ids=[args.gpu])
         vq_loss.train()
@@ -389,11 +402,10 @@ def main(args):
             min_lr=5e-5,
         )
     else:
-        vq_loss = None
+        vq_loss.module = vq_loss
         optimizer_disc = None
         scaler_disc = None
         disc_lr_scheduler = None
-        logger.info("No discriminator training")
 
     args.lr = args.lr * args.global_batch_size / 128
     
@@ -514,8 +526,9 @@ def main(args):
             model_start_time = time.time()
             with torch.cuda.amp.autocast(dtype=ptdtype):  
                 #calculate the time cost of the forward process
+                gt_latents = imgs.clone().detach()
                 
-                recons_imgs, codebook_loss, sem_loss, detail_loss, dependency_loss, times = vq_model(imgs, epoch, alpha, beta, delta)
+                recons_imgs, z, codebook_loss, sem_loss, detail_loss, dependency_loss, diff_loss, times = vq_model(imgs, epoch, alpha, beta, delta)
                 
                 model_enc_time.append(times[0])
                 model_quant_time.append(times[1])
@@ -525,12 +538,12 @@ def main(args):
 
                 loss_comb_start_time = time.time()
                 if args.enc_type != 'simple':
-                    loss_gen = vq_loss(codebook_loss, sem_loss, detail_loss, dependency_loss, imgs, recons_imgs, optimizer_idx=0, global_step=train_steps+1,
-                                   last_layer=vq_model.module.decoder.last_layer, 
-                                   logger=logger, log_every=args.log_every, fade_blur_schedule=fade_blur_schedule)
+                    last_layer = vq_model.module.decoder.last_layer
                 else:
-                    rec_loss = F.mse_loss(imgs.contiguous(), recons_imgs.contiguous())
-                    loss_gen = rec_loss + codebook_loss[0] + codebook_loss[1] + codebook_loss[2] 
+                    last_layer = None
+
+                loss_gen = vq_loss(codebook_loss, sem_loss, detail_loss, dependency_loss, diff_loss, imgs, recons_imgs, optimizer_idx=0, global_step=train_steps+1,
+                                   last_layer=last_layer, logger=logger, log_every=args.log_every, fade_blur_schedule=fade_blur_schedule)
                 loss_comb_end_time = time.time()
                 loss_comb_time.append(loss_comb_end_time - loss_comb_start_time)
 
@@ -556,11 +569,11 @@ def main(args):
 
             # discriminator training
             discriminator_start_time = time.time()
-            if args.enc_type != 'simple':
+            if args.use_disc_loss:
                 optimizer_disc.zero_grad()
 
                 with torch.cuda.amp.autocast(dtype=ptdtype):
-                    loss_disc = vq_loss(codebook_loss, sem_loss, detail_loss, dependency_loss, imgs, recons_imgs, optimizer_idx=1, global_step=train_steps+1,
+                    loss_disc = vq_loss(codebook_loss, sem_loss, detail_loss, dependency_loss, diff_loss, imgs, recons_imgs, optimizer_idx=1, global_step=train_steps+1,
                                         logger=logger, log_every=args.log_every, fade_blur_schedule=fade_blur_schedule)
                 scaler_disc.scale(loss_disc).backward()
                 if args.max_grad_norm != 0.0:
@@ -611,104 +624,10 @@ def main(args):
 
                         vq_loss.module.wandb_tracker.log({"recon_images": [wandb.Image(image)]}, step=train_steps)
 
-            #Save checkpoint:
-            if train_steps % args.ckpt_every == 0 and train_steps > 0:
-                if args.save_best:
-                    vq_model.eval()
-                    total = 0
-                    samples = []
-                    gt = []
-                    for x, _ in tqdm(val_loader, desc=f'evaluation for step {train_steps:07d}', disable=not rank == 0):
-                        with torch.no_grad():
-                            x = x.to(device, non_blocking=True)
-                            sample = vq_model.module.img_to_reconstructed_img(x)
-                            sample = torch.clamp(127.5 * sample + 128.0, 0, 255).permute(0, 2, 3, 1).to(torch.uint8).contiguous()
-                            x = torch.clamp(127.5 * x + 128.0, 0, 255).permute(0, 2, 3, 1).to(torch.uint8).contiguous()
-                        
-                        sample = torch.cat(dist.nn.all_gather(sample), dim=0)
-                        x = torch.cat(dist.nn.all_gather(x), dim=0)
-                        samples.append(sample.to("cpu", dtype=torch.uint8).numpy())
-                        gt.append(x.to("cpu", dtype=torch.uint8).numpy())
-
-                        total += sample.shape[0]
-                    vq_model.train()
-                    logger.info(f"Ealuate total {total} files.")
-                    dist.barrier()
-
-                    if rank == 0:
-                        samples = np.concatenate(samples, axis=0)
-                        gt = np.concatenate(gt, axis=0)
-                        config = tf.ConfigProto(
-                            allow_soft_placement=True  # allows DecodeJpeg to run on CPU in Inception graph
-                        )
-                        config.gpu_options.allow_growth = True
-
-                        evaluator = Evaluator(tf.Session(config=config),batch_size=32)
-                        evaluator.warmup()
-                        logger.info("computing reference batch activations...")
-                        ref_acts = evaluator.read_activations(gt)
-                        logger.info("computing/reading reference batch statistics...")
-                        ref_stats, _ = evaluator.read_statistics(gt, ref_acts)
-                        logger.info("computing sample batch activations...")
-                        sample_acts = evaluator.read_activations(samples)
-                        logger.info("computing/reading sample batch statistics...")
-                        sample_stats, _ = evaluator.read_statistics(samples, sample_acts)
-                        FID = sample_stats.frechet_distance(ref_stats)
-
-                        logger.info(f"traing step: {train_steps:07d}, FID {FID:07f}")
-                        # eval code, delete prev if not the best
-                        if curr_fid == None:
-                            curr_fid = [FID, train_steps]
-                        elif FID <= curr_fid[0]:
-                            # os.remove(f"{cloud_checkpoint_dir}/{curr_fid[1]:07d}.pt")
-                            curr_fid = [FID, train_steps]
-
-                        vq_loss.module.wandb_tracker.log({"eval FID": FID}, step=train_steps)
-
-                    dist.barrier()
-
-                if rank == 0:
-                    if args.compile:
-                        model_weight = vq_model.module._orig_mod.state_dict()
-                    else:
-                        model_weight = vq_model.module.state_dict()  
-                    checkpoint = {
-                        "model": model_weight,
-                        "optimizer": optimizer.state_dict(),
-                        "discriminator": vq_loss.module.discriminator.state_dict(),
-                        "optimizer_disc": optimizer_disc.state_dict(),
-                        "steps": train_steps,
-                        "args": args
-                    }
-                    if args.ema:
-                        checkpoint["ema"] = ema.state_dict()
-                    if not args.no_local_save:
-                        checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
-                        torch.save(checkpoint, checkpoint_path)
-                        logger.info(f"Saved checkpoint to {checkpoint_path}")
-                    
-                    # cloud_checkpoint_path = f"{cloud_checkpoint_dir}/{train_steps:07d}.pt"
-                    # torch.save(checkpoint, cloud_checkpoint_path)
-                    # logger.info(f"Saved checkpoint in cloud to {cloud_checkpoint_path}")
-
-                    if args.save_best:
-                        last_checkpoint_path = f"{args.cloud_save_path}/last_ckpt.pt"
-                        if os.path.exists(last_checkpoint_path):
-                            os.remove(last_checkpoint_path)
-                        else:
-                            os.makedirs(f"{args.cloud_save_path}", exist_ok=True)
-                        torch.save(checkpoint, last_checkpoint_path)
-                        logger.info(f"Saved checkpoint in cloud to {last_checkpoint_path}")
-                        if curr_fid[1] == train_steps:
-                            best_checkpoint_path = f"{args.cloud_save_path}/best_ckpt.pt"
-                            torch.save(checkpoint, best_checkpoint_path)
-                            logger.info(f"Saved checkpoint in cloud to {best_checkpoint_path}")
-
-                dist.barrier()
+            
 
             iteration_end_time = time.time()
             iteration_time.append(iteration_end_time - iteration_start_time)
-
 
 
         if vqvae_lr_scheduler is not None:
@@ -719,47 +638,123 @@ def main(args):
         epoch_duration = epoch_end_time - epoch_start_time
         epoch_duration_str = time.strftime("%H:%M:%S", time.gmtime(epoch_duration))
         logger.info(f"Epoch {epoch} finished in {epoch_duration_str}.")
+            
+
+        #Evaluation and save checkpoints:
+        #if train_steps % args.ckpt_every == 0 and train_steps > 0:
+        if epoch == args.epochs - 1:
+            # log time:
+            log_time(logger, 'model', model_time)
+            log_time(logger, 'model_enc', model_enc_time)
+            log_time(logger, 'model_quant', model_quant_time)
+            log_time(logger, 'model_dec', model_dec_time)
+            log_time(logger, 'model_sem', model_sem_time)
+            log_time(logger, 'model_detail', model_detail_time)
+            log_time(logger, 'loss_comb', loss_comb_time)
+            log_time(logger, 'backward', backward_time)
+            log_time(logger, 'optimizer', optimizer_time)
+            log_time(logger, 'discriminator', discriminator_time)
+            log_time(logger, 'iteration', iteration_time)
+            #Evaluation
+            if args.save_best:
+                vq_model.eval()
+                total = 0
+                samples = []
+                gt = []
+                for x, _ in tqdm(val_loader, desc=f'evaluation for step {train_steps:07d}', disable=not rank == 0):
+                    with torch.no_grad():
+                        x = x.to(device, non_blocking=True)
+                        sample = vq_model.module.img_to_reconstructed_img(x)
+                        sample = torch.clamp(127.5 * sample + 128.0, 0, 255).permute(0, 2, 3, 1).to(torch.uint8).contiguous()
+                        x = torch.clamp(127.5 * x + 128.0, 0, 255).permute(0, 2, 3, 1).to(torch.uint8).contiguous()
+                    
+                    sample = torch.cat(dist.nn.all_gather(sample), dim=0)
+                    x = torch.cat(dist.nn.all_gather(x), dim=0)
+                    samples.append(sample.to("cpu", dtype=torch.uint8).numpy())
+                    gt.append(x.to("cpu", dtype=torch.uint8).numpy())
+                    total += sample.shape[0]
+                vq_model.train()
+                logger.info(f"Ealuate total {total} files.")
+                dist.barrier()
+                if rank == 0:
+                    samples = np.concatenate(samples, axis=0)
+                    gt = np.concatenate(gt, axis=0)
+                    config = tf.ConfigProto(
+                        allow_soft_placement=True  # allows DecodeJpeg to run on CPU in Inception graph
+                    )
+                    config.gpu_options.allow_growth = True
+                    evaluator = Evaluator(tf.Session(config=config),batch_size=32)
+                    evaluator.warmup()
+                    logger.info("computing reference batch activations...")
+                    ref_acts = evaluator.read_activations(gt)
+                    logger.info("computing/reading reference batch statistics...")
+                    ref_stats, _ = evaluator.read_statistics(gt, ref_acts)
+                    logger.info("computing sample batch activations...")
+                    sample_acts = evaluator.read_activations(samples)
+                    logger.info("computing/reading sample batch statistics...")
+                    sample_stats, _ = evaluator.read_statistics(samples, sample_acts)
+                    FID = sample_stats.frechet_distance(ref_stats)
+                    logger.info(f"traing step: {train_steps:07d}, FID {FID:07f}")
+                    # eval code, delete prev if not the best
+                    if curr_fid == None:
+                        curr_fid = [FID, train_steps]
+                    elif FID <= curr_fid[0]:
+                        # os.remove(f"{cloud_checkpoint_dir}/{curr_fid[1]:07d}.pt")
+                        curr_fid = [FID, train_steps]
+                    vq_loss.module.wandb_tracker.log({"eval FID": FID}, step=train_steps)
+                dist.barrier()
+            # Save checkpoints:
+            if rank == 0:
+                if args.compile:
+                    model_weight = vq_model.module._orig_mod.state_dict()
+                else:
+                    model_weight = vq_model.module.state_dict()
+                if args.use_disc_loss:
+                    discriminator = vq_loss.module.discriminator.state_dict()
+                    optimizer_disc = optimizer_disc.state_dict()
+                else:
+                    discriminator = None
+                    optimizer_disc = None  
+                checkpoint = {
+                    "model": model_weight,
+                    "optimizer": optimizer.state_dict(),
+                    "discriminator": discriminator,
+                    "optimizer_disc": optimizer_disc,
+                    "steps": train_steps,
+                    "args": args
+                }
+                if args.ema:
+                    checkpoint["ema"] = ema.state_dict()
+                if not args.no_local_save:
+                    checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
+                    torch.save(checkpoint, checkpoint_path)
+                    logger.info(f"Saved checkpoint to {checkpoint_path}")
+                
+                # cloud_checkpoint_path = f"{cloud_checkpoint_dir}/{train_steps:07d}.pt"
+                # torch.save(checkpoint, cloud_checkpoint_path)
+                # logger.info(f"Saved checkpoint in cloud to {cloud_checkpoint_path}")
+                if args.save_best:
+                    last_checkpoint_path = f"{args.cloud_save_path}/last_ckpt.pt"
+                    if os.path.exists(last_checkpoint_path):
+                        os.remove(last_checkpoint_path)
+                    else:
+                        os.makedirs(f"{args.cloud_save_path}", exist_ok=True)
+                    torch.save(checkpoint, last_checkpoint_path)
+                    logger.info(f"Saved checkpoint in cloud to {last_checkpoint_path}")
+                    if curr_fid[1] == train_steps:
+                        best_checkpoint_path = f"{args.cloud_save_path}/best_ckpt.pt"
+                        torch.save(checkpoint, best_checkpoint_path)
+                        logger.info(f"Saved checkpoint in cloud to {best_checkpoint_path}")
+            
+            
+            dist.barrier()
 
 
-        log_time(logger, 'model', model_time)
-        log_time(logger, 'model_enc', model_enc_time)
-        log_time(logger, 'model_quant', model_quant_time)
-        log_time(logger, 'model_dec', model_dec_time)
-        log_time(logger, 'model_sem', model_sem_time)
-        log_time(logger, 'model_detail', model_detail_time)
-        log_time(logger, 'loss_comb', loss_comb_time)
-        log_time(logger, 'backward', backward_time)
-        log_time(logger, 'optimizer', optimizer_time)
-        log_time(logger, 'discriminator', discriminator_time)
-        log_time(logger, 'iteration', iteration_time)
-
-
-    # total_model_time = sum(model_time)
-    # avg_model_time = total_model_time / len(model_time)
-    # logger.info(f"Average model time: {avg_model_time:.4f} seconds")
-    # logger.info(f"Total model time: {total_model_time:.4f} seconds")
-
-
-
-    # total_optimizer_time = sum(optimizer_time)
-    # avg_optimizer_time = total_optimizer_time / len(optimizer_time)
-    # logger.info(f"Average optimizer time: {avg_optimizer_time:.4f} seconds")
-    # logger.info(f"Total optimizer time: {total_optimizer_time:.4f} seconds")
-
-    # total_discriminator_time = sum(discriminator_time)
-    # avg_discriminator_time = total_discriminator_time / len(discriminator_time)
-    # logger.info(f"Average discriminator time: {avg_discriminator_time:.4f} seconds")
-    # logger.info(f"Total discriminator time: {total_discriminator_time:.4f} seconds")
-
-    # total_iteration_time = sum(iteration_time)
-    # avg_iteration_time = total_iteration_time / len(iteration_time)
-    # logger.info(f"Average iteration time: {avg_iteration_time:.4f} seconds")
-    # logger.info(f"Total iteration time: {total_iteration_time:.4f} seconds")
 
     
     #draw the curve of the forward_time and iteration_time with the x axis as the iteration step
     # Generate x-axis values (iteration steps)
-    iteration_steps = list(range(1, len(model_time) + 1))
+    # iteration_steps = list(range(1, len(model_time) + 1))
 
     # # Plot forward_time
     # plt.figure(figsize=(10, 6))

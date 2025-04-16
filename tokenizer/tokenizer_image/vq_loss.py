@@ -82,54 +82,73 @@ class VQLoss(nn.Module):
                  disc_num_layers=3, disc_in_channels=3, disc_weight=1.0, disc_adaptive_weight = False,
                  gen_adv_loss='hinge', reconstruction_loss='l2', reconstruction_weight=1.0, 
                  codebook_weight=1.0, perceptual_weight=1.0, lecam_loss_weight=None, norm_type='bn', aug_prob=1,
+                 use_diffloss=False, use_perceptual_loss=False, use_disc_loss=False, use_lecam_loss=False
     ):
         super().__init__()
+        # diffusion loss
+        self.use_diffloss = use_diffloss
+        
         # discriminator loss
-        assert disc_type in ["patchgan", "stylegan", 'dinodisc', 'samdisc']
-        assert disc_loss in ["hinge", "vanilla", "non-saturating"]
-        self.disc_type = disc_type
-        if disc_type == "patchgan":
-            self.discriminator = PatchGANDiscriminator(
-                input_nc=disc_in_channels, 
-                n_layers=disc_num_layers,
-                ndf=disc_dim,
-            )
-        elif disc_type == "stylegan":
-            self.discriminator = StyleGANDiscriminator(
-                input_nc=disc_in_channels, 
-                image_size=image_size,
-            )
-        elif disc_type == "dinodisc":
-            self.discriminator = DINODiscriminator(norm_type=norm_type)  # default 224 otherwise crop
-            self.daug = DiffAug(prob=aug_prob, cutout=0.2)
-        elif disc_type == "samdisc":
-            self.discriminator = SAMDiscriminator(norm_type=norm_type)
-        else:
-            raise ValueError(f"Unknown GAN discriminator type '{disc_type}'.")
-        if disc_loss == "hinge":
-            self.disc_loss = hinge_d_loss
-        elif disc_loss == "vanilla":
-            self.disc_loss = vanilla_d_loss
-        elif disc_loss == "non-saturating":
-            self.disc_loss = non_saturating_d_loss
-        else:
-            raise ValueError(f"Unknown GAN discriminator loss '{disc_loss}'.")
-        self.discriminator_iter_start = disc_start
-        self.disc_weight = disc_weight
-        self.disc_adaptive_weight = disc_adaptive_weight
+        self.use_disc_loss = use_disc_loss
+        if self.use_disc_loss:
+            assert disc_type in ["patchgan", "stylegan", 'dinodisc', 'samdisc']
+            assert disc_loss in ["hinge", "vanilla", "non-saturating"]
+            self.disc_type = disc_type
+            if disc_type == "patchgan":
+                self.discriminator = PatchGANDiscriminator(
+                    input_nc=disc_in_channels, 
+                    n_layers=disc_num_layers,
+                    ndf=disc_dim,
+                )
+            elif disc_type == "stylegan":
+                self.discriminator = StyleGANDiscriminator(
+                    input_nc=disc_in_channels, 
+                    image_size=image_size,
+                )
+            elif disc_type == "dinodisc":
+                self.discriminator = DINODiscriminator(norm_type=norm_type)  # default 224 otherwise crop
+                self.daug = DiffAug(prob=aug_prob, cutout=0.2)
+            elif disc_type == "samdisc":
+                self.discriminator = SAMDiscriminator(norm_type=norm_type)
+            else:
+                raise ValueError(f"Unknown GAN discriminator type '{disc_type}'.")
+            if disc_loss == "hinge":
+                self.disc_loss = hinge_d_loss
+            elif disc_loss == "vanilla":
+                self.disc_loss = vanilla_d_loss
+            elif disc_loss == "non-saturating":
+                self.disc_loss = non_saturating_d_loss
+            else:
+                raise ValueError(f"Unknown GAN discriminator loss '{disc_loss}'.")
+            self.discriminator_iter_start = disc_start
+            self.disc_weight = disc_weight
+            self.disc_adaptive_weight = disc_adaptive_weight
 
-        assert gen_adv_loss in ["hinge", "non-saturating"]
-        # gen_adv_loss
-        if gen_adv_loss == "hinge":
-            self.gen_adv_loss = hinge_gen_loss
-        elif gen_adv_loss == "non-saturating":
-            self.gen_adv_loss = non_saturating_gen_loss
+            assert gen_adv_loss in ["hinge", "non-saturating"]
+            # gen_adv_loss
+            if gen_adv_loss == "hinge":
+                self.gen_adv_loss = hinge_gen_loss
+            elif gen_adv_loss == "non-saturating":
+                self.gen_adv_loss = non_saturating_gen_loss
+            else:
+                raise ValueError(f"Unknown GAN generator loss '{gen_adv_loss}'.")
         else:
-            raise ValueError(f"Unknown GAN generator loss '{gen_adv_loss}'.")
+            self.discriminator = None
+            self.disc_loss = 0
+            self.gen_adv_loss = 0
+            self.discriminator_iter_start = 0
+            self.disc_weight = 0
+            self.disc_adaptive_weight = False
 
         # perceptual loss
-        self.perceptual_loss = LPIPS().eval()
-        self.perceptual_weight = perceptual_weight
+        self.use_perceptual_loss = use_perceptual_loss
+        if self.use_perceptual_loss:
+            assert perceptual_weight > 0
+            self.perceptual_loss = LPIPS().eval()
+            self.perceptual_weight = perceptual_weight
+        else:
+            self.perceptual_loss = None
+            self.perceptual_weight = 1
 
         # reconstruction loss
         if reconstruction_loss == "l1":
@@ -143,12 +162,14 @@ class VQLoss(nn.Module):
         # codebook loss
         self.codebook_weight = codebook_weight
 
-        self.lecam_loss_weight = lecam_loss_weight
-        if self.lecam_loss_weight is not None:
-            self.lecam_ema = LeCAM_EMA()
+        self.use_lecam_loss = use_lecam_loss
+        if self.use_lecam_loss:
+            self.lecam_loss_weight = lecam_loss_weight
+            if self.lecam_loss_weight is not None:
+                self.lecam_ema = LeCAM_EMA()
 
         if tdist.get_rank() == 0:
-            self.wandb_tracker = wandb.init(project='MSVQ',)
+            self.wandb_tracker = wandb.init(project='VQ',)
 
     def calculate_adaptive_weight(self, nll_loss, g_loss, last_layer):
         nll_grads = torch.autograd.grad(nll_loss, last_layer, retain_graph=True)[0]
@@ -158,38 +179,54 @@ class VQLoss(nn.Module):
         d_weight = torch.clamp(d_weight, 0.0, 1e4).detach()
         return d_weight.detach()
 
-    def forward(self, codebook_loss, sem_loss, detail_loss, dependency_loss, inputs, reconstructions, optimizer_idx, global_step, last_layer=None,
+    def forward(self, codebook_loss, sem_loss, detail_loss, dependency_loss, diff_loss, inputs, reconstructions, optimizer_idx, global_step, last_layer=None,
                 logger=None, log_every=100, fade_blur_schedule=0):
         # generator update
         if optimizer_idx == 0:
             # reconstruction loss
             rec_loss = self.rec_loss(inputs.contiguous(), reconstructions.contiguous())
 
+            #diffusion loss
+            if self.use_diffloss:
+                diff_loss = diff_loss
+            else:
+                diff_loss = 0
+
             # perceptual loss
-            p_loss = self.perceptual_loss(inputs.contiguous(), reconstructions.contiguous())
-            p_loss = torch.mean(p_loss)
+            if self.use_perceptual_loss:
+                p_loss = self.perceptual_loss(inputs.contiguous(), reconstructions.contiguous())
+                p_loss = torch.mean(p_loss)
+            else:
+                p_loss = 0
 
             # discriminator loss
-            if self.disc_type == "dinodisc":
-                if fade_blur_schedule < 1e-6:
-                    fade_blur_schedule = 0
-                logits_fake = self.discriminator(self.daug.aug(reconstructions.contiguous(), fade_blur_schedule))
+            if self.use_disc_loss:
+                if self.disc_type == "dinodisc":
+                    if fade_blur_schedule < 1e-6:
+                        fade_blur_schedule = 0
+                    logits_fake = self.discriminator(self.daug.aug(reconstructions.contiguous(), fade_blur_schedule))
+                else:
+                    logits_fake = self.discriminator(reconstructions.contiguous())
+                generator_adv_loss = self.gen_adv_loss(logits_fake)
+
+                if self.disc_adaptive_weight:
+                    null_loss = self.rec_weight * rec_loss + self.perceptual_weight * p_loss
+                    disc_adaptive_weight = self.calculate_adaptive_weight(null_loss, generator_adv_loss, last_layer=last_layer)
+                else:
+                    disc_adaptive_weight = 1
+                disc_weight = adopt_weight(self.disc_weight, global_step, threshold=self.discriminator_iter_start)
             else:
-                logits_fake = self.discriminator(reconstructions.contiguous())
-            generator_adv_loss = self.gen_adv_loss(logits_fake)
-            
-            if self.disc_adaptive_weight:
-                null_loss = self.rec_weight * rec_loss + self.perceptual_weight * p_loss
-                disc_adaptive_weight = self.calculate_adaptive_weight(null_loss, generator_adv_loss, last_layer=last_layer)
-            else:
+                generator_adv_loss = 0
+                disc_weight = 0
                 disc_adaptive_weight = 1
-            disc_weight = adopt_weight(self.disc_weight, global_step, threshold=self.discriminator_iter_start)
+            
             if sem_loss is None:
                 sem_loss = 0
             if detail_loss is None:
                 detail_loss = 0
             if dependency_loss is None:
                 dependency_loss = 0
+            
             loss = self.rec_weight * rec_loss + \
                 self.perceptual_weight * p_loss + \
                 disc_adaptive_weight * disc_weight * generator_adv_loss + \
@@ -199,26 +236,27 @@ class VQLoss(nn.Module):
                 rec_loss = self.rec_weight * rec_loss
                 p_loss = self.perceptual_weight * p_loss
                 generator_adv_loss = disc_adaptive_weight * disc_weight * generator_adv_loss
-                logger.info(f"(Generator) rec_loss: {rec_loss:.4f}, perceptual_loss: {p_loss:.4f}, sem_loss: {sem_loss:.4f}, detail_loss: {detail_loss} "
+                logger.info(f"(Generator) rec_loss: {rec_loss:.4f}, perceptual_loss: {p_loss:.4f}, diff_loss: {diff_loss:.4f} sem_loss: {sem_loss:.4f}, detail_loss: {detail_loss} "
                             f"dependency_loss: {dependency_loss} vq_loss: {codebook_loss[0]:.4f}, commit_loss: {codebook_loss[1]:.4f}, entropy_loss: {codebook_loss[2]:.4f}, "
                             f"codebook_usage: {codebook_loss[3]}, generator_adv_loss: {generator_adv_loss:.4f}, "
                             f"disc_adaptive_weight: {disc_adaptive_weight:.4f}, disc_weight: {disc_weight:.4f}")
-                if tdist.get_rank() == 0:
-                    self.wandb_tracker.log({
-                        "rec_loss": rec_loss,
-                        "perceptual_loss": p_loss,
-                        "sem_loss": sem_loss,
-                        "detail_loss": detail_loss,
-                        "dependency_loss": dependency_loss, 
-                        "vq_loss": codebook_loss[0],
-                        "commit_loss": codebook_loss[1],
-                        "entropy_loss": codebook_loss[2],
-                        "codebook_usage": np.mean(codebook_loss[3]),
-                        "generator_adv_loss": generator_adv_loss,
-                        "disc_adaptive_weight": disc_adaptive_weight,
-                        "disc_weight": disc_weight,
-                    },
-                    step=global_step)
+                #if tdist.get_rank() == 0:
+                self.wandb_tracker.log({
+                    "rec_loss": rec_loss,
+                    "perceptual_loss": p_loss,
+                    "diff_loss": diff_loss,
+                    "sem_loss": sem_loss,
+                    "detail_loss": detail_loss,
+                    "dependency_loss": dependency_loss, 
+                    "vq_loss": codebook_loss[0],
+                    "commit_loss": codebook_loss[1],
+                    "entropy_loss": codebook_loss[2],
+                    "codebook_usage": np.mean(codebook_loss[3]),
+                    "generator_adv_loss": generator_adv_loss,
+                    "disc_adaptive_weight": disc_adaptive_weight,
+                    "disc_weight": disc_weight,
+                },
+                step=global_step)
             return loss
 
         # discriminator update
