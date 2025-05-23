@@ -274,9 +274,9 @@ class GaussianDiffusion:
         if model_kwargs is None:
             model_kwargs = {}
 
-        B, C = x.shape[:2]
+        B, C = x.shape[:2]#B=2048,C=32
         assert t.shape == (B,)
-        model_output = model(x, t, **model_kwargs)
+        model_output = model(x, t, **model_kwargs)#model_output.shape=[2048, 64], all zeros
         if isinstance(model_output, tuple):
             model_output, extra = model_output
         else:
@@ -333,6 +333,11 @@ class GaussianDiffusion:
 
     def _predict_xstart_from_eps(self, x_t, t, eps):
         assert x_t.shape == eps.shape
+        # if t[0] == 99:
+        #     print("eps.mean = ", eps.mean())
+        #     print("eps.std = ", eps.std())
+        #     print("eps.max = ", eps.max())
+        #     print("eps.min = ", eps.min())
         return (
             _extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t
             - _extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * eps
@@ -492,16 +497,16 @@ class GaussianDiffusion:
             img = noise
         else:
             img = th.randn(*shape).cuda()
-        indices = list(range(self.num_timesteps))[::-1]
+        indices = list(range(self.num_timesteps))[::-1]#[99, ..., 0]
 
-        if progress:
+        if progress:#False
             # Lazy import so that we don't depend on tqdm.
             from tqdm.auto import tqdm
 
             indices = tqdm(indices)
 
         for i in indices:
-            t = th.tensor([i] * shape[0]).cuda()
+            t = th.tensor([i] * shape[0]).cuda()#t.shape = (2048)
             with th.no_grad():
                 out = self.p_sample(
                     model,

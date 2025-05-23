@@ -59,6 +59,14 @@ warnings.filterwarnings('ignore')
 import wandb
 #os.environ["WANDB_MODE"] = "disabled"
 
+# export MASTER_ADDR=localhost
+# export MASTER_PORT=29500
+# export WORLD_SIZE=1
+# export RANK=0
+# export LOCAL_RANK=0
+# export TORCH_DISTRIBUTED_DEBUG=DETAIL
+# python tokenizer/tokenizer_image/xqgan_train.py --config /home/hjy22/repos/ImageFolder/configs/VQ-8192.yaml
+
 import matplotlib.pyplot as plt
 #################################################################################
 #                                  Training Loop                                #
@@ -177,6 +185,9 @@ def parse_args():
     parser.add_argument("--use_perceptual_loss", action='store_true', default=False, help="if use perceptual loss")
     parser.add_argument("--use_disc_loss", action='store_true', default=False, help="if use discriminator loss")
     parser.add_argument("--use_lecam_loss", action='store_true', default=False, help="if use lecam loss")
+    parser.add_argument("--train_stage", type=str, default='full', choices=['full', 'diff_only', 'dec_only'], help="train stage")
+    parser.add_argument("--use_latent_perturbation", default=False, help="if use latent perturbation")
+    parser.add_argument("--wandb_project", type=str, default="xqgan")
     
     args = parser.parse_args()
     if args.config is not None:
@@ -187,21 +198,21 @@ def parse_args():
 
         # re-parse command-line args to overwrite with any command-line inputs
     args = parser.parse_args()
+
+    if args.train_stage == 'diff_only' or args.train_stage == 'dec_only':
+        assert args.vq_ckpt is not None, "Please provide a checkpoint to resume training from."
+
+    if args.train_stage == 'full' or args.train_stage == 'dec_only':
+        args.use_diffloss = False
+    elif args.train_stage == 'diff_only':
+        args.use_diffloss = True
+
     return args
 
 def main(args):
     """
     Trains a new model.
     """
-
-    # export MASTER_ADDR=localhost
-    # export MASTER_PORT=29500
-    # export WORLD_SIZE=1
-    # export RANK=0
-    # export LOCAL_RANK=0
-    # export TORCH_DISTRIBUTED_DEBUG=DETAIL
-    # python tokenizer/tokenizer_image/xqgan_train.py --config /home/hjy22/repos/ImageFolder/configs/VQ-8192.yaml
-
 
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
 
@@ -347,7 +358,9 @@ def main(args):
         guide_type_1=args.guide_type_1,
         guide_type_2=args.guide_type_2,
         lfq=args.lfq,
-        use_diffloss=args.use_diffloss
+        use_diffloss=args.use_diffloss,
+        use_latent_perturbation=args.use_latent_perturbation,
+        train_stage=args.train_stage
     )
     logger.info(f"VQ Model Parameters: {sum(p.numel() for p in vq_model.parameters()):,}")
     if args.ema:
@@ -375,7 +388,9 @@ def main(args):
         use_diffloss=args.use_diffloss,
         use_perceptual_loss=args.use_perceptual_loss,
         use_disc_loss=args.use_disc_loss,
-        use_lecam_loss=args.use_lecam_loss
+        use_lecam_loss=args.use_lecam_loss,
+        train_stage=args.train_stage,
+        wandb_project=args.wandb_project,
         
     ).to(device)
     
@@ -439,25 +454,53 @@ def main(args):
     if args.vq_ckpt:
         checkpoint = torch.load(args.vq_ckpt, map_location="cpu")
         vq_model.load_state_dict(checkpoint["model"])
+        #vq_model.diffloss.load_state_dict(checkpoint["diff_model"])
+        
+        #加载 checkpoint
+        # state_dict = checkpoint["model"]
+
+        # # 过滤掉 diffloss 相关的参数
+        # filtered_state_dict = {k: v for k, v in state_dict.items() if not k.startswith('diffloss')}
+
+        # # 加载到新模型（假设 vq_model 是新实例化的模型，且 diffloss 已经是新的）
+        # missing, unexpected = vq_model.load_state_dict(filtered_state_dict, strict=False)
+        # print("Missing keys:", missing)
+        # print("Unexpected keys:", unexpected)
+
+
         if args.ema:
             ema.load_state_dict(checkpoint["ema"])
         optimizer.load_state_dict(checkpoint["optimizer"])
-        if not args.debug_disc:
-            vq_loss.discriminator.load_state_dict(checkpoint["discriminator"])
-            optimizer_disc.load_state_dict(checkpoint["optimizer_disc"])
-        else:
-            num_step = checkpoint["optimizer_disc"]["state"][next(iter(checkpoint["optimizer_disc"]["state"]))]['step']
-            for param_state in optimizer_disc.state.values():
-                param_state['step'] = num_step
+
+        #Update the learning rate scheduler:
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = args.lr
+
+        if args.use_disc_loss:
+            if not args.debug_disc:
+                vq_loss.discriminator.load_state_dict(checkpoint["discriminator"])
+                optimizer_disc.load_state_dict(checkpoint["optimizer_disc"])
+            else:
+                num_step = checkpoint["optimizer_disc"]["state"][next(iter(checkpoint["optimizer_disc"]["state"]))]['step']
+                for param_state in optimizer_disc.state.values():
+                    param_state['step'] = num_step
         if not args.finetune:
             train_steps = checkpoint["steps"] if "steps" in checkpoint else int(args.vq_ckpt.split('/')[-1].split('.')[0])
-            start_epoch = int(train_steps / int(len(dataset) / args.global_batch_size)) + 1
-            train_steps = int(start_epoch * int(len(dataset) / args.global_batch_size))
+            #if checkpoint has "epoch" key, use it to calculate the start epoch
+            if "epoch" in checkpoint:
+                start_epoch = checkpoint["epoch"]
+            else:
+                start_epoch = 400
+            #start_epoch = int(train_steps / int(len(dataset) / 32)) + 1
+            # start_epoch = int(train_steps / int(len(dataset) / args.global_batch_size)) + 1
+            # train_steps = int(start_epoch * int(len(dataset) / args.global_batch_size))
+            #train_steps = int(start_epoch * int(len(dataset) / 32))
         else:
             train_steps = 0
             start_epoch = 0           
         del checkpoint
-        vq_model.finetune(args.enc_tuning_method, args.dec_tuning_method)
+        if args.enc_type != 'simple':
+            vq_model.finetune(args.enc_tuning_method, args.dec_tuning_method)
         logger.info(f"Resume training from checkpoint: {args.vq_ckpt}")
         logger.info(f"Initial state: steps={train_steps}, epochs={start_epoch}")
     else:
@@ -498,7 +541,14 @@ def main(args):
     discriminator_time = []
     iteration_time = []
 
+
+    
+
     for epoch in tqdm(range(start_epoch, args.epochs)):
+        
+        #check whether the parameters of encoder have been updated
+        #encoder_params_before = [param.clone() for param in vq_model.module.encoder.parameters()]
+
         #calculate each epoch's running time
         epoch_start_time = time.time()
         ratio = get_random_ratio(args.anneal_start, args.anneal_end, args.end_ratio, epoch)
@@ -527,9 +577,9 @@ def main(args):
             with torch.cuda.amp.autocast(dtype=ptdtype):  
                 #calculate the time cost of the forward process
                 gt_latents = imgs.clone().detach()
-                
-                recons_imgs, z, codebook_loss, sem_loss, detail_loss, dependency_loss, diff_loss, times = vq_model(imgs, epoch, alpha, beta, delta)
-                
+                #imgs.shape = (32, 3, 32, 32)
+                recons_imgs, z, codebook_loss, sem_loss, detail_loss, dependency_loss, diff_loss, times = vq_model(imgs, epoch, alpha, beta, delta, vq_loss.module.wandb_tracker)
+                #recons_imgs.shape = (32, 3, 32, 32)
                 model_enc_time.append(times[0])
                 model_quant_time.append(times[1])
                 model_dec_time.append(times[2])
@@ -562,6 +612,23 @@ def main(args):
                 torch.nn.utils.clip_grad_norm_(vq_model.parameters(), args.max_grad_norm)
             scaler.step(optimizer)
             scaler.update()
+
+
+            # check whether the parameters of encoder have been updated
+            # for name, param in vq_model.module.encoder.named_parameters():
+            #     if param.grad is not None:
+            #         print(f"param {name} grad: {param.grad.mean()}")
+            #     else:
+            #         print(f"param {name} grad: None")
+
+            # encoder_params_after = [param.clone() for param in vq_model.module.encoder.parameters()]
+            # for before, after in zip(encoder_params_before, encoder_params_after):
+            #     if not torch.equal(before, after):
+            #         print("Encoder 参数已更新")
+            #         break
+            #     else:
+            #         print("Encoder 参数未更新")
+
             if args.ema:
                 update_ema(ema, vq_model.module._orig_mod if args.compile else vq_model.module)
             optimizer_end_time = time.time()
@@ -664,7 +731,10 @@ def main(args):
                 for x, _ in tqdm(val_loader, desc=f'evaluation for step {train_steps:07d}', disable=not rank == 0):
                     with torch.no_grad():
                         x = x.to(device, non_blocking=True)
-                        sample = vq_model.module.img_to_reconstructed_img(x)
+                        #x.shape = (32, 3, 32, 32)
+                        #sample = vq_model.module.img_to_reconstructed_img(x)
+                        sample = vq_model.module.reconstruct(x)
+                        #sample.shape = (32, 32, 32, 3)
                         sample = torch.clamp(127.5 * sample + 128.0, 0, 255).permute(0, 2, 3, 1).to(torch.uint8).contiguous()
                         x = torch.clamp(127.5 * x + 128.0, 0, 255).permute(0, 2, 3, 1).to(torch.uint8).contiguous()
                     
@@ -714,12 +784,15 @@ def main(args):
                     optimizer_disc = optimizer_disc.state_dict()
                 else:
                     discriminator = None
-                    optimizer_disc = None  
+                    optimizer_disc = None
+                diff_model = vq_model.module.diffloss.state_dict()
                 checkpoint = {
                     "model": model_weight,
                     "optimizer": optimizer.state_dict(),
                     "discriminator": discriminator,
                     "optimizer_disc": optimizer_disc,
+                    "diff_model": diff_model,
+                    "epoch": epoch,
                     "steps": train_steps,
                     "args": args
                 }

@@ -2,42 +2,45 @@ data_path: /home/hjy22/repos/CIFAR10/val
 val_data_path: /home/hjy22/repos/CIFAR10/val
 dataset: cifar10
 save_best: true
-image_size: 256
+image_size: 32
 vq_model: VQ-16
 enc_type: simple
 dec_type: simple
 semantic_guide: none
 detail_guide: none
-global_batch_size: 32
-epochs: 300
+global_batch_size: 128
+epochs: 16400
 #lr_scheduler: cosine
 lr_scheduler: none
 lr: 3e-5
+#lr: 1e-4
 #max_grad_norm: 1.0
 #reconstruction_weight: 4.0
 codebook_embed_dim: 32
 codebook_size: 8192
 abs_pos_embed: true
 product_quant: 1
-ema: true
+ema: false
 codebook_drop: 0.0
 encoder_model: vit_base_patch14_dinov2.lvd142m
 decoder_model: vit_base_patch14_dinov2.lvd142m
 
-use_diffloss: false
+
 use_perceptual_loss: false
 use_disc_loss: false
 use_lecam_loss: false
 use_semantic_loss: false
 use_detail_loss: false
 
-num_latent_tokens: 256
+#num_latent_tokens: 256 #(default, dinov2)
+num_latent_tokens: 64
+
 v_patch_nums: [16]
 half_sem: false
 guide_type_1: class
 start_drop: 3
-log_every: 1000
-vis_every: 150000
+log_every: 500
+vis_every: 1000
 ckpt_every: 10000
 sem_loss_weight: 0.1
 enc_tuning_method: full
@@ -49,7 +52,24 @@ disc_epoch_start: 0
 disc_type: none
 aug_fade_steps: 0
 disc_adaptive_weight: true
-cloud_save_path: XQGAN-8192-simple-cifar10
+use_latent_perturbation: false
 
 anneal_start: 100
 anneal_end: 200
+
+# train_stage: full
+# use_diffloss: false
+# vq_ckpt: 
+# cloud_save_path: test_train_stage1.1
+
+train_stage: diff_only
+use_diffloss: true
+vq_ckpt: test_train_stage2_modified2/last_ckpt.pt
+cloud_save_path: test_train_stage2_modified2
+
+# train_stage: dec_only
+# use_diffloss: false
+# vq_ckpt: test_train_stage2/last_ckpt.pt
+# cloud_save_path: test_train_stage3
+
+wandb_project: VQ_DiffLoss_Modified2

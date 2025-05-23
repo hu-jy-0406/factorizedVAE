@@ -77,6 +77,9 @@ class ModelArgs:
     test_model: bool = False
 
     use_diffloss: bool = False
+    use_latent_perturbation: bool = False
+    train_stage: str = 'full'
+    diffusion_batch_mul: int = 1
 
 
 class VQModel(nn.Module):
@@ -91,6 +94,9 @@ class VQModel(nn.Module):
         self.clip_norm = config.clip_norm
         config.num_latent_tokens = config.num_latent_tokens * config.product_quant  # scale num_latent_tokens for PQ
         self.use_diffloss = config.use_diffloss
+        self.use_latent_perturbation = config.use_latent_perturbation
+        self.train_stage = config.train_stage
+
 
         if config.enc_type == 'cnn':
             self.encoder = Encoder(ch_mult=config.encoder_ch_mult, z_channels=config.z_channels, dropout=config.dropout_p)
@@ -112,6 +118,11 @@ class VQModel(nn.Module):
             self.quant_conv = nn.Conv2d(config.z_channels, config.codebook_embed_dim, 1)
         else:
             raise NotImplementedError(f"Encoder type {config.enc_type} not implemented")
+
+        # freeze encoder if needed
+        if self.train_stage == 'diff_only' or self.train_stage == 'dec_only':
+            for param in self.encoder.parameters():
+                param.requires_grad = False
 
         if config.dec_type == 'cnn':
             self.decoder = Decoder(ch_mult=config.decoder_ch_mult, z_channels=config.z_channels, dropout=config.dropout_p)
@@ -250,16 +261,16 @@ class VQModel(nn.Module):
             self.eval()
             [p.requires_grad_(False) for p in self.parameters()]
 
-        if self.use_diffloss:
-            self.diffloss = DiffLoss(
-                target_channels=config.codebook_embed_dim,
-                z_channels=config.codebook_embed_dim,
-                width=config.codebook_embed_dim,
-                depth=3,
-                num_sampling_steps='100',
-                grad_checkpointing=False
-            )
-            self.diffusion_batch_mul = 4
+        # if self.use_diffloss:
+        self.diffloss = DiffLoss(
+            target_channels=config.num_latent_tokens * config.codebook_embed_dim,
+            z_channels=config.num_latent_tokens * config.codebook_embed_dim,
+            width=config.num_latent_tokens * config.codebook_embed_dim,
+            depth=12,
+            num_sampling_steps='100',
+            grad_checkpointing=False
+        )
+        self.diffusion_batch_mul = config.diffusion_batch_mul
     
     def finetune(self, enc_tuning_method, dec_tuning_method):
         self.encoder.finetine(enc_tuning_method)
@@ -294,12 +305,45 @@ class VQModel(nn.Module):
 
     def forward_loss(self, z, target):
         bsz, seq_len, _ = target.shape
-        target = target.reshape(bsz * seq_len, -1).repeat(self.diffusion_batch_mul, 1)
-        z = z.reshape(bsz*seq_len, -1).repeat(self.diffusion_batch_mul, 1)
-        loss = self.diffloss(z=z, target=target, mask=None)
+        # target = target.reshape(bsz * seq_len, -1).repeat(self.diffusion_batch_mul, 1)
+        # z = z.reshape(bsz*seq_len, -1).repeat(self.diffusion_batch_mul, 1)
+        target = target.reshape(bsz, -1).repeat(self.diffusion_batch_mul, 1)
+        z = z.reshape(bsz, -1).repeat(self.diffusion_batch_mul, 1)
+        loss = self.diffloss(z=z.clone().detach(), target=target, mask=None)
         return loss
     
-    def forward(self, input, epoch, alpha, beta, delta):
+    def reconstruct(self, input):
+        h = self.encode(input)
+        b, c, l, _ = h.shape
+        quant, usages, mean_vq_loss, mean_commit_loss, mean_entropy = self.quantize.forward(h, ret_usages=True, dropout=None)
+        if self.train_stage == 'full':
+            dec = self.decode(quant)
+        else:
+            #quant.shape = (32, 32, 8, 8), (b, c, w, h)
+            B, C, W, H = quant.shape
+            #z = quant.permute(0, 2, 3, 1).reshape(B, -1)
+            z = quant.reshape(B, -1)
+            pass
+            #z.shape = (2048, 32)
+            #with guide
+            sampled_z_hat = self.diffloss.sample(z=z, temperature=1.0, cfg=1.0)
+            #without guide
+            #sampled_z_hat = self.diffloss.sample(z=torch.zeros_like(z), temperature=1.0, cfg=1)
+            #sampled_z_hat.shape = (2048, 32)
+
+            #verify
+            #h_reshaped = h.permute(0, 2, 3, 1).reshape(-1, h.shape[1])
+            # loss_h_quant = F.mse_loss(h_reshaped, z, reduction='mean')
+            # loss_h_z_hat = F.mse_loss(h_reshaped, sampled_z_hat, reduction='mean')
+            #print("loss_h_quant: ", loss_h_quant.item(), "loss_h_z_hat: ", loss_h_z_hat.item(), "z_hat is closer to h: ", loss_h_z_hat.item() < loss_h_quant.item())
+
+
+            sampled_z_hat = sampled_z_hat.reshape(B, C, W, H)
+            dec = self.decode(sampled_z_hat.clone().detach())
+        return dec
+
+
+    def forward(self, input, epoch, alpha, beta, delta, logger=None):
         model_enc_time_start = time.time()
         h = self.encode(input)
         model_enc_time = time.time() - model_enc_time_start
@@ -330,23 +374,100 @@ class VQModel(nn.Module):
             dependency_loss = 0.0
             quant, usages, mean_vq_loss, mean_commit_loss, mean_entropy = self.quantize.forward(h, ret_usages=True, dropout=dropout_rand)
             #print(alpha, beta, delta)
-            #quant = add_perturbation(h, quant, self.quantize.z_channels, self.quantize.codebook_norm, self.quantize.embedding, alpha, beta, delta)
+            if self.use_latent_perturbation:
+                quant = add_perturbation(h, quant, self.quantize.z_channels, self.quantize.codebook_norm, self.quantize.embedding, alpha, beta, delta)
             quant_list = [quant]
         model_quant_time = time.time() - model_quant_time_start
 
         model_dec_time_start = time.time()
-        dec = self.decode(quant)
+
+
+        if self.train_stage == 'full':
+            dec = self.decode(quant)
+        elif self.train_stage == 'diff_only':
+            # print("diff_only")
+            # param1 = self.diffloss.net.parameters
+            # param2 = self.diffloss.net.parameters
+            # print("param1 == param2: ", param1 == param2)
+            dec = 0
+        else:
+            #self.diffloss.net.eval()
+            #quant.shape = (32, 32, 8, 8), (b, c, w, h)
+            # B, C, W, H = quant.shape
+            # z = quant.permute(0, 2, 3, 1).reshape(-1, c)
+            # pass
+            # #z.shape = (2048, 32)
+            # sampled_z_hat = torch.randn_like(h)
+
+            # param1 = self.diffloss.net.parameters
+
+            # sampled_z_hat = self.diffloss.sample(z=z, temperature=1.0)
+
+            # param2 = self.diffloss.net.parameters
+
+            # print("param1 == param2: ", param1 == param2)
+            
+            # #sampled_z_hat.shape = (2048, 32)
+            # sampled_z_hat = sampled_z_hat.reshape(B, W, H, C).permute(0, 3, 1, 2)
+            
+            # #verify
+            # loss_h_quant = F.mse_loss(h, quant, reduction='mean')
+            # loss_h_z_hat = F.mse_loss(h, sampled_z_hat, reduction='mean')
+            # #add wandb log curve
+            # if logger is not None:
+            #     logger.log({"loss_h_quant": loss_h_quant.item(), "loss_h_z_hat": loss_h_z_hat.item()})
+            # else:
+            #     raise NotImplementedError("logger is None, please provide a logger")
+            # #self.diffloss.net.eval
+            dec = 0
+            # param3 = self.diffloss.net.parameters
+            # print("param1 == param3: ", param1 == param3)
+            #dec = self.decode(sampled_z_hat.clone().detach())
+
+        
+        
         model_dec_time = time.time() - model_dec_time_start
 
         #calculate the diffusion loss
         gt_latents = h.clone().detach()
         if self.use_diffloss:
-            #reshape quant from (b, c, l, _) to (b, l, c)
-            quant = quant.permute(0, 2, 1, 3).reshape(b, l*l, -1)
+            #reshape quant from (b, c, l, _) to (b, l*l, c)
+            B, C, W, H = quant.shape
+            #quant = quant.permute(0, 2, 3, 1).reshape(B, -1)
+            z = quant.reshape(B,-1).clone().detach()
             #reshape gt_latents from (b, c, l, _) to (b, l, c)
-            gt_latents = gt_latents.permute(0, 2, 1, 3).reshape(b, l*l, -1)
+            #gt_latents = gt_latents.permute(0, 2, 3, 1).reshape(B, -1)
+            target = gt_latents.reshape(B, -1).clone().detach()
             #z_channels = 32, target_channels = 32
-            diff_loss = self.forward_loss(z=quant, target=gt_latents)
+            #quant.shape = (32, 64, 32)
+            #gt_latents.shape = (32, 64, 32)
+            # z = quant.clone().detach()
+            #with guide
+            #diff_loss = self.forward_loss(z=z, target=gt_latents)
+            #with learnable guide
+            #diff_loss = self.forward_loss(z=quant, target=gt_latents)
+            diff_loss = self.diffloss(z=z, target=target, mask=None)
+            #without_guide
+            #diff_loss = self.forward_loss(z=torch.zeros_like(z), target=gt_latents)
+            
+            if epoch >= 400 and epoch % 100 == 0:
+                #with guide
+                sampled_z_hat = self.diffloss.sample(z=z, temperature=1.0, cfg=1.0)
+                #without_guide
+                #sampled_z_hat = self.diffloss.sample(z=torch.zeros_like(z_flattened), temperature=1.0, cfg=1)
+                # z_hat = sampled_z_hat.reshape(b, l*l, c)
+                #verify
+                # loss_h_quant = F.mse_loss(gt_latents, quant, reduction='mean')
+                # loss_h_z_hat = F.mse_loss(gt_latents, z_hat, reduction='mean')
+                #verify flattened one
+                loss_h_quant = F.mse_loss(target, z, reduction='mean')
+                loss_h_z_hat = F.mse_loss(target, sampled_z_hat, reduction='mean')
+                if logger is not None:
+                    logger.log({"loss_h_quant": loss_h_quant.item(), "loss_h_z_hat": loss_h_z_hat.item()})
+                else:
+                    raise NotImplementedError("logger is None, please provide a logger")
+            
+            
             #print("diff_loss: ", diff_loss)
             model_sem_time = 0
             model_detail_time = 0
@@ -438,6 +559,7 @@ class VQModel(nn.Module):
         f = self.quant_conv(h)
 
         if self.product_quant > 1:
+            raise NotImplementedError("haven't implemented diffloss for product_quant yet")
             b, c, l, _ = f.shape
             f_list = f.chunk(chunks=self.product_quant, dim=2)
             f_list = [f.view(b, -1, int(sqrt(l // self.product_quant)), int(sqrt(l // self.product_quant))) for f in f_list]
@@ -447,9 +569,27 @@ class VQModel(nn.Module):
                 f_hats_list = [self.quantizes[i].f_to_idxBl_or_fhat(f, to_fhat=True, v_patch_nums=self.v_patch_nums) for i, f in enumerate(f_list)]
             f_hats = [self.post_quant_conv(torch.cat(f_hats, dim=1)) for f_hats in zip(*f_hats_list)]
         else:
+            #one patch without product quant
             if len(self.v_patch_nums) == 1:
+                #ls_f_hat_BChw[0].shape = (32, 32, 8, 8)
                 ls_f_hat_BChw = self.quantize.f_to_idxBl_or_fhat(f, to_fhat=True, v_patch_nums=None)
+                if self.use_diffloss:
+                    B, C, h, w = ls_f_hat_BChw[0].shape
+                    for i in range(len(ls_f_hat_BChw)):
+                        f_hat = ls_f_hat_BChw[i].clone().reshape(B, -1)
+                        #f_hat.shape = (32, 64, 32)
+                        z_hat = self.diffloss.sample(z=f_hat, temperature=1.0, cfg=1.0)
+                        #z_hat =f_hat
+                        ls_f_hat_BChw[i] = z_hat.view(B, C, h, w)
+                        #verify
+                        # f_reshaped = f.permute(0, 2, 3, 1).reshape(f.shape[0], -1)
+                        # #calculate mse loss between f and f_hat, return a scalar
+                        # loss_f_f_hat = F.mse_loss(f_reshaped, f_hat, reduction='mean')
+                        # loss_f_z_hat = F.mse_loss(f_reshaped, z_hat, reduction='mean')
+                        # print("is z_hat closer to f than f_hat? ", loss_f_f_hat > loss_f_z_hat)
+
             else:
+                raise NotImplementedError("haven't implemented diffloss for multi-patches yet")
                 ls_f_hat_BChw = self.quantize.f_to_idxBl_or_fhat(f, to_fhat=True, v_patch_nums=self.v_patch_nums)
             f_hats = [self.post_quant_conv(f_hat) for f_hat in ls_f_hat_BChw]
 
@@ -457,8 +597,10 @@ class VQModel(nn.Module):
             f_hats = [f_hat.flatten(2).permute(0, 2, 1) for f_hat in f_hats]
 
         if last_one:
+            #f_hats[-1].shape = (32, 256, 8, 8)
             return self.decoder(f_hats[-1]).clamp_(-1, 1)
         else:
+            #(32, 3, 32, 32)
             return [self.decoder(f_hat).clamp_(-1, 1) for f_hat in f_hats]
 
     def img_to_sem_feat(self, x,) -> List[torch.Tensor]:
@@ -845,7 +987,8 @@ class VectorQuantizer(nn.Module):
             margin = tdist.get_world_size() * (z.numel() / self.z_channels) / self.vocab_size * 0.08
 
             codebook_usage = (self.ema_vocab_hit_SV >= margin).float().mean().item() * 100
-
+        else:
+            codebook_usage = None
 
         # compute loss
         commit_loss = self.beta * torch.mean((z_q.detach() - z) ** 2)

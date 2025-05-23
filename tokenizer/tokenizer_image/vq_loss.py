@@ -82,9 +82,13 @@ class VQLoss(nn.Module):
                  disc_num_layers=3, disc_in_channels=3, disc_weight=1.0, disc_adaptive_weight = False,
                  gen_adv_loss='hinge', reconstruction_loss='l2', reconstruction_weight=1.0, 
                  codebook_weight=1.0, perceptual_weight=1.0, lecam_loss_weight=None, norm_type='bn', aug_prob=1,
-                 use_diffloss=False, use_perceptual_loss=False, use_disc_loss=False, use_lecam_loss=False
+                 use_diffloss=False, use_perceptual_loss=False, use_disc_loss=False, use_lecam_loss=False,
+                 train_stage='full', wandb_project='VQLoss'
     ):
         super().__init__()
+
+        self.train_stage = train_stage
+
         # diffusion loss
         self.use_diffloss = use_diffloss
         
@@ -169,7 +173,7 @@ class VQLoss(nn.Module):
                 self.lecam_ema = LeCAM_EMA()
 
         if tdist.get_rank() == 0:
-            self.wandb_tracker = wandb.init(project='VQ',)
+            self.wandb_tracker = wandb.init(project=wandb_project,)
 
     def calculate_adaptive_weight(self, nll_loss, g_loss, last_layer):
         nll_grads = torch.autograd.grad(nll_loss, last_layer, retain_graph=True)[0]
@@ -183,8 +187,7 @@ class VQLoss(nn.Module):
                 logger=None, log_every=100, fade_blur_schedule=0):
         # generator update
         if optimizer_idx == 0:
-            # reconstruction loss
-            rec_loss = self.rec_loss(inputs.contiguous(), reconstructions.contiguous())
+            
 
             #diffusion loss
             if self.use_diffloss:
@@ -192,6 +195,13 @@ class VQLoss(nn.Module):
             else:
                 diff_loss = 0
 
+            if self.train_stage == 'diff_only':
+                rec_loss = 0
+                codebook_loss = (0, 0, 0, codebook_loss[3])
+            
+            # reconstruction loss
+            else:
+                rec_loss = self.rec_loss(inputs.contiguous(), reconstructions.contiguous())
             # perceptual loss
             if self.use_perceptual_loss:
                 p_loss = self.perceptual_loss(inputs.contiguous(), reconstructions.contiguous())
@@ -230,7 +240,8 @@ class VQLoss(nn.Module):
             loss = self.rec_weight * rec_loss + \
                 self.perceptual_weight * p_loss + \
                 disc_adaptive_weight * disc_weight * generator_adv_loss + \
-                codebook_loss[0] + codebook_loss[1] + codebook_loss[2] + sem_loss + detail_loss + dependency_loss
+                codebook_loss[0] + codebook_loss[1] + codebook_loss[2] + sem_loss + detail_loss + dependency_loss +\
+                diff_loss
             
             if global_step % log_every == 0:
                 rec_loss = self.rec_weight * rec_loss

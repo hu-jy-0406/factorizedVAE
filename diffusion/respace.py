@@ -117,9 +117,9 @@ class SpacedDiffusion(GaussianDiffusion):
 class _WrappedModel:
     def __init__(self, model, timestep_map, original_num_steps):
         self.model = model
-        self.timestep_map = timestep_map
+        self.timestep_map = timestep_map#len = 100, 0-999
         # self.rescale_timesteps = rescale_timesteps
-        self.original_num_steps = original_num_steps
+        self.original_num_steps = original_num_steps#1000
 
     def __call__(self, x, ts, **kwargs):
         map_tensor = th.tensor(self.timestep_map, device=ts.device, dtype=ts.dtype)

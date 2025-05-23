@@ -22,11 +22,17 @@ class DiffLoss(nn.Module):
 
         self.train_diffusion = create_diffusion(timestep_respacing="", noise_schedule="cosine")
         self.gen_diffusion = create_diffusion(timestep_respacing=num_sampling_steps, noise_schedule="cosine")
+        print("created")
 
     def forward(self, target, z, mask=None):
         t = torch.randint(0, self.train_diffusion.num_timesteps, (target.shape[0],), device=target.device)
         model_kwargs = dict(c=z)
         loss_dict = self.train_diffusion.training_losses(self.net, target, t, model_kwargs)
+        # print("target.shape = ", target.shape)
+        # print("target_max = ", target.max())
+        # print("target_min = ", target.min())
+        # print("target_mean = ", target.mean())
+        # print("target_std = ", target.std())
         loss = loss_dict["loss"]
         if mask is not None:
             loss = (loss * mask).sum() / mask.sum()
@@ -40,6 +46,7 @@ class DiffLoss(nn.Module):
             model_kwargs = dict(c=z, cfg_scale=cfg)
             sample_fn = self.net.forward_with_cfg
         else:
+            #noise.shape = (2048, 32)
             noise = torch.randn(z.shape[0], self.in_channels).cuda()
             model_kwargs = dict(c=z)
             sample_fn = self.net.forward
@@ -48,7 +55,11 @@ class DiffLoss(nn.Module):
             sample_fn, noise.shape, noise, clip_denoised=False, model_kwargs=model_kwargs, progress=False,
             temperature=temperature
         )
-
+        # print("sampled_token_latent.shape = ", sampled_token_latent.shape)
+        # print("sampled_token_latent_max = ", sampled_token_latent.max())
+        # print("sampled_token_latent_min = ", sampled_token_latent.min())
+        # print("sampled_token_latent_mean = ", sampled_token_latent.mean())
+        # print("sampled_token_latent_std = ", sampled_token_latent.std())
         return sampled_token_latent
 
 
@@ -222,8 +233,18 @@ class SimpleMLPAdaLN(nn.Module):
         :param c: conditioning from AR transformer.
         :return: an [N x C] Tensor of outputs.
         """
-        #x.shape = [8192, 256]
-        #c.shape = [8192, 32]
+        #cifar_10 training:
+        # x.shape = [8192, 32](before and after embedding)
+        # c.shape = [8192, 32]
+        # t.shape = [8192](before embedding)
+        # t.shape = [8192, 32](after embedding)
+
+
+        #cifar_10 inference:
+        # x.shape = [32, 32]
+        # c.shape = [32, 64, 32]
+        # t.shape = [32](after embedding)
+
         x = self.input_proj(x)
         t = self.time_embed(t)
         c = self.cond_embed(c)
