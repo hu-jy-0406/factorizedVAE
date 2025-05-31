@@ -64,7 +64,7 @@ anneal_end: 200
 
 train_stage: diff_only
 use_diffloss: true
-vq_ckpt: test_train_stage2_modified2/last_ckpt.pt
+vq_ckpt: test_train_stage1/last_ckpt.pt
 cloud_save_path: test_train_stage2_modified2
 
 # train_stage: dec_only

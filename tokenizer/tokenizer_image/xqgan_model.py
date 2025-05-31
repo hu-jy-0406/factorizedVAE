@@ -341,6 +341,12 @@ class VQModel(nn.Module):
             sampled_z_hat = sampled_z_hat.reshape(B, C, W, H)
             dec = self.decode(sampled_z_hat.clone().detach())
         return dec
+    
+    def get_quant(self, input):
+        h = self.encode(input)
+        b, c, l, _ = h.shape
+        quant, usages, mean_vq_loss, mean_commit_loss, mean_entropy = self.quantize.forward(h, ret_usages=True, dropout=None)
+        return quant
 
 
     def forward(self, input, epoch, alpha, beta, delta, logger=None):
@@ -943,7 +949,8 @@ class VectorQuantizer(nn.Module):
     def no_weight_decay(self):
         return ['embedding.weight',]
 
-    def forward(self, z, ret_usages=True, dropout=None):
+    def forward(self, z
+                , ret_usages=True, dropout=None):
 
         vocab_hit_V = torch.zeros(self.vocab_size, dtype=torch.float, device=z.device)
 
@@ -1033,6 +1040,58 @@ class VectorQuantizer(nn.Module):
         f_hat_or_idx_Bl: List[torch.Tensor] = [z_q if to_fhat else min_encoding_indices]
 
         return f_hat_or_idx_Bl
+    
+    def get_codebook_indices(self, z: torch.Tensor) -> torch.Tensor:
+        """
+        Given an input z (B, C, H, W), return the codebook indices (B, H, W).
+        """
+        # reshape z -> (batch, height, width, channel) and flatten
+        z = torch.einsum('b c h w -> b h w c', z).contiguous()
+        z_flattened = z.view(-1, self.z_channels)
+
+        if self.codebook_norm:
+            z = F.normalize(z, p=2, dim=-1)
+            z_flattened = F.normalize(z_flattened, p=2, dim=-1)
+            embedding = F.normalize(self.embedding.weight, p=2, dim=-1)
+        else:
+            embedding = self.embedding.weight
+
+        #embedding.shape = (8192, 32)
+        # distances from z to embeddings e_j (z - e)^2 = z^2 + e^2 - 2 e * z
+        d = torch.sum(z_flattened ** 2, dim=1, keepdim=True) + \
+            torch.sum(embedding ** 2, dim=1) - 2 * \
+            torch.einsum('bd,dn->bn', z_flattened, torch.einsum('n d -> d n', embedding))
+
+        # argmin find indices and embeddings
+        min_encoding_indices = torch.argmin(d, dim=1)
+
+        #check if the indices are within the range of vocab_size
+        if torch.any(min_encoding_indices >= self.vocab_size) or torch.any(min_encoding_indices < 0):
+            raise ValueError("Some indices are out of bounds: min_encoding_indices = {}".format(min_encoding_indices))
+
+        # reshape back to (B, H, W)
+        B, C, H, W = z.permute(0, 3, 1, 2).shape
+        indices = min_encoding_indices.view(B, H, W)
+        return indices
+    
+    def codebook_lookup(self, indices: torch.Tensor) -> torch.Tensor:
+        """
+        Inverse of get_codebook_indices. Given integer codebook indices of shape (B, H, W),
+        returns the corresponding latent embeddings of shape (B, C, H, W).
+        """
+        b, h, w = indices.shape
+        indices_flat = indices.view(-1)  # (B*H*W)
+
+        # Normalize embedding if self.codebook_norm is True
+        if self.codebook_norm:
+            embedding_norm = F.normalize(self.embedding.weight, p=2, dim=-1)  # (vocab_size, C)
+            z_q = embedding_norm[indices_flat]
+        else:
+            z_q = self.embedding(indices_flat)
+
+        # Reshape back to (B, H, W, C), then permute to (B, C, H, W)
+        z_q = z_q.view(b, h, w, self.z_channels).permute(0, 3, 1, 2)
+        return z_q
 
 
 def orthogonal_cosine_loss(A, B):

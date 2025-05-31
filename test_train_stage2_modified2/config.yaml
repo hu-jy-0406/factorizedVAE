@@ -3,7 +3,7 @@ data_face_path:
 cloud_save_path: test_train_stage2_modified2
 no_local_save: false
 vq_model: VQ-16
-vq_ckpt: test_train_stage2_modified2/last_ckpt.pt
+vq_ckpt: test_train_stage1/last_ckpt.pt
 finetune: false
 ema: false
 codebook_size: 8192
