@@ -1092,6 +1092,23 @@ class VectorQuantizer(nn.Module):
         # Reshape back to (B, H, W, C), then permute to (B, C, H, W)
         z_q = z_q.view(b, h, w, self.z_channels).permute(0, 3, 1, 2)
         return z_q
+    
+    def codebook_lookup_flat(self, indices: torch.Tensor) -> torch.Tensor:
+        """
+        Input shape: (B, L)
+        Output shape: (B, L, C)
+        """
+        b, l = indices.shape
+        indices_flat = indices.view(-1)
+        # Normalize embedding if self.codebook_norm is True
+        if self.codebook_norm:
+            embedding_norm = F.normalize(self.embedding.weight, p=2, dim=-1)  # (vocab_size, C)
+            z_q = embedding_norm[indices_flat]
+        else:
+            z_q = self.embedding(indices_flat)
+        # Reshape back to (B, L, C)
+        z_q = z_q.view(b, l, self.z_channels)
+        return z_q
 
 
 def orthogonal_cosine_loss(A, B):

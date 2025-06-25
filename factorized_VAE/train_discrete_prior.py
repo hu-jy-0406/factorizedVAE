@@ -209,7 +209,7 @@ def generate_causal_mask(seq_len, device):
     # Upper-triangular mask of ones => True means "mask out"
     return torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1).bool()
 
-class TokenARTransformer(nn.Module):
+class DiscretePrior(nn.Module):
     """
     Autoregressive Transformer using nn.TransformerDecoder.
     Predict token i given [CLS] and tokens < i.
@@ -263,57 +263,44 @@ class TokenARTransformer(nn.Module):
         return logits
 
     @torch.no_grad()
+    def get_next_token(self, x):
+        B, L = x.shape
+        memory = torch.zeros(B, 1, self.d_model, device=device)
+
+        embs = self.token_emb(x)  # shape (B, L, d_model)
+        h = self.pos_emb(embs)  # shape (B, L, d_model)
+        
+        out = self.decoder(tgt=h, memory=memory, tgt_mask=None)
+        out = self.ln(out)  # shape (B, L, d_model)
+        logits = self.head(out)  # shape (B, L, vocab_size)
+        last_logits = logits[:, -1, :]
+        p = last_logits.softmax(dim=-1)  # Apply softmax to get probabilities
+        #sample from the distribution p
+        next_token = torch.multinomial(p, num_samples=1)
+        return next_token  # shape (B, 1)
+
+
+    @torch.no_grad()
     def generate(self, num_samples):
         device = next(model.parameters()).device
 
-        # Dummy memory => shape (B, 1, d_model)
-        memory = torch.zeros(num_samples, 1, self.d_model, device=device)
         token_list = []
         start_token = torch.zeros((num_samples,1)).long().to(device) # Start with <s> token
         token_list.append(start_token)  # Append <s> token ID (assumed to be 0)
 
         for i in range(self.seq_len):
-            
             tokens = torch.cat(token_list, dim=1).to(device)  # shape (B, i+1)
-            #tokens = torch.tensor(token_list, dtype=torch.long, device=device)  # shape (1, i+1)
-
-            embeds = self.token_emb(tokens)
-            # Apply sinusoidal position embeddings => shape (B, L+1, d_model)
-            h = self.pos_emb(embeds)
-
-            #causal_mask = generate_causal_mask(self.seq_len, x.device)
-            out = self.decoder(tgt=h, memory=memory, tgt_mask=None)
-            out = self.ln(out)
-            logits = self.head(out)  
-            #print(logits.shape)
-            last_logits = logits[:, -1, :]
-            # if i == 0:
-            #     print("first logits softmax:", last_logits.softmax(dim=-1))
-            p = last_logits.softmax(dim=-1)  # Apply softmax to get probabilities
-            #sample from the distribution p
-            next_token = torch.multinomial(p, num_samples=1)  # Sample from the distribution
-            #next_token = torch.argmax(last_logits).item()
+            next_token = self.get_next_token(tokens)
             token_list.append(next_token) # Update the next token in the sequence
-            #print(tokens)
 
-        #tokens = torch.tensor(token_list, dtype=torch.long, device=device)
         tokens = torch.cat(token_list, dim=1)  # shape (B, seq_len+1)
         tokens = tokens[:,1:]
 
-        #compute cross entropy loss
-        # criterion = nn.CrossEntropyLoss()
-        # gt = gt.view(-1).to(device)
-        # loss = criterion(logits.reshape(-1, vocab_size), gt)
-        # print("loss:", loss.item())
-
-        # Drop the initial [CLS] so final output is length seq_len
-        return tokens # shape (seq_len,)
+        return tokens
 
 def train(model, resume_path=None):
 
     logger = wandb.init(project="DiscretePrior")
-    # logger.define_metric("loss", step_metric="epoch")
-    # logger.define_metric("acc_val", step_metric="epoch")
 
     # Hyperparameters
     npy_path = "factorized_VAE/cifar10_val_indices.npy"
@@ -419,7 +406,7 @@ def sample(model, num_samples=10):
         for i, img in enumerate(samples):
             grid_img.paste(img, (i % 5 * 32, i // 5 * 32))
         #grid_img.show()  # Display the grid of images
-        grid_img.save("factorized_VAE/sampled_images.png")  # Save the grid image
+        grid_img.save("factorized_VAE/sampled_images2.png")  # Save the grid image
     else:
         print("No samples generated.")
     return samples
@@ -437,51 +424,6 @@ def sample(model, num_samples=10):
     # gen_img = vq_model.decode(gen_latents)  # shape (1, 3, 256, 256)
     # save_image(gen_img, "factorized_VAE/generated_image.png")
     
-def generate_samples(vq_model, prior_model, args):
-    """Generate samples using the prior model and decode them with VQVAE"""
-    os.makedirs(args.sample_dir, exist_ok=True)
-    
-    # Set seed for reproducibility
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-    
-    samples = []
-    total = 0
-    
-    with torch.no_grad():
-        for i in tqdm(range(0, args.num_samples, args.batch_size), desc="Generating samples"):
-            batch_size = min(args.batch_size, args.num_samples - total)
-            
-            # Generate discrete codes from the prior model
-            # This depends on your specific implementation
-            token_indices = prior_model.sample(
-                batch_size=batch_size,
-                temperature=args.temperature,
-                top_k=args.top_k,
-                top_p=args.top_p
-            )
-            
-            # Decode the discrete codes to images using VQVAE
-            gen_imgs = vq_model.decode_code(token_indices)
-            
-            # Process images for FID calculation
-            gen_imgs = torch.clamp(127.5 * gen_imgs + 128.0, 0, 255).permute(0, 2, 3, 1).to(torch.uint8).contiguous()
-            samples.append(gen_imgs.cpu().numpy())
-            
-            # Save some sample images
-            if i == 0:
-                # Save first batch as grid
-                grid = make_grid((torch.clamp(gen_imgs[:16].permute(0, 3, 1, 2).float() / 255.0, 0, 1)), nrow=4)
-                save_image(grid, f"{args.sample_dir}/samples.png")
-            
-            total += batch_size
-            if total >= args.num_samples:
-                break
-    
-    samples = np.concatenate(samples, axis=0)
-    print(f"Generated {samples.shape[0]} samples")
-    return samples
-
 
 def evaluation_FID(model, val_data_path):
     #prepare dataset
@@ -645,7 +587,7 @@ if __name__ == "__main__":
     vocab_size = 8192  # set this to match your codebook size
     seq_len = 64
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = TokenARTransformer(vocab_size, seq_len=seq_len, d_model=512, nhead=8, num_layers=8).to(device)
+    model = DiscretePrior(vocab_size, seq_len=seq_len, d_model=512, nhead=8, num_layers=8).to(device)
 
     resume_path = "factorized_VAE/DiscretePrior_val_epoch2000.pth"
     #resume_path = None

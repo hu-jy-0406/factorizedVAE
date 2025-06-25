@@ -163,7 +163,7 @@ def save_image(image, name=None):
     image = Image.fromarray(image)
     image.save(name)
 
-def get_latent(loader, vq_model):
+def get_discrete_latent(loader, vq_model):
     latents = []
     for x, y in tqdm(loader, desc="Encoding images"):
         x = x.cuda()
@@ -174,6 +174,18 @@ def get_latent(loader, vq_model):
     # Save latents to a file
     np.save("factorized_VAE/cifar10_train_latents.npy", latents)
     print("Latents saved to factorized_VAE/cifar10_train_latents.npy")
+
+def get_continous_latent(loader, vq_model):
+    latents = []
+    for x, y in tqdm(loader, desc="Encoding images"):
+        x = x.cuda()
+        latent = vq_model.encode(x)
+        latents.append(latent.detach().cpu().numpy())
+    latents = np.concatenate(latents, axis=0)
+    print("Latent shape: ", latents.shape)
+    # Save latents to a file
+    np.save("factorized_VAE/cifar10_val_latents_continous.npy", latents)
+    print("Latents saved to factorized_VAE/cifar10_val_latents_continous.npy")
 
 def main(args):
     # set seed
@@ -190,7 +202,7 @@ def main(args):
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
     ])
 
-    dataset = ImageFolder("/home/hjy22/repos/CIFAR10/train", transform=transform)
+    dataset = ImageFolder("/home/hjy22/repos/CIFAR10/val", transform=transform)
     loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=4)
 
     # create and load model
@@ -236,41 +248,41 @@ def main(args):
     missing, unexpected = vq_model.load_state_dict(filtered_state_dict, strict=False)
     vq_model.eval().cuda()
 
-    #get_latent(loader, vq_model)
+    #get_continous_latent(loader, vq_model)
 
     #load the latents
-    latents = np.load("factorized_VAE/cifar10_train_latents.npy")
-    print("Latents shape: ", latents.shape)
-    #change the latents to a tensor
-    batch_size = 100  # or smaller if you still get OOM
-    indices_list = []
-    for i in range(0, latents.shape[0], batch_size):
-        batch = torch.from_numpy(latents[i:i+batch_size]).cuda()
-        indices = vq_model.quantize.get_codebook_indices(batch)
-        indices_list.append(indices.cpu())
-    indices = torch.cat(indices_list, dim=0)
-    print("Indices shape: ", indices.shape)
+    # latents = np.load("factorized_VAE/cifar10_train_latents.npy")
+    # print("Latents shape: ", latents.shape)
+    # #change the latents to a tensor
+    # batch_size = 100  # or smaller if you still get OOM
+    # indices_list = []
+    # for i in range(0, latents.shape[0], batch_size):
+    #     batch = torch.from_numpy(latents[i:i+batch_size]).cuda()
+    #     indices = vq_model.quantize.get_codebook_indices(batch)
+    #     indices_list.append(indices.cpu())
+    # indices = torch.cat(indices_list, dim=0)
+    # print("Indices shape: ", indices.shape)
 
-    #save the indices to a file
-    np.save("factorized_VAE/cifar10_train_indices.npy", indices.cpu().numpy())
-    print("Indices saved to factorized_VAE/cifar10_train_indices.npy")
+    # #save the indices to a file
+    # np.save("factorized_VAE/cifar10_train_indices.npy", indices.cpu().numpy())
+    # print("Indices saved to factorized_VAE/cifar10_train_indices.npy")
     
 
     #test
     #choose one image randomly from the dataloader
-    # for i, (x, y) in enumerate(loader):
-    #     if i == 1:
-    #         x = x.cuda()
-    #         break
-    # #show the image x
-    # save_image(x, "factorized_VAE/original_image.png")
-    # #encode
-    # latent = vq_model.get_quant(x)
-    # print("latent shape: ", latent.shape)
-    # #decode
-    # dec = vq_model.decode(latent)
-    # print("dec shape: ", dec.shape)
-    # save_image(dec, "factorized_VAE/reconstructed_image.png")
+    for i, (x, y) in enumerate(loader):
+        if i == 1:
+            x = x.cuda()
+            break
+    #show the image x
+    save_image(x, "factorized_VAE/original_image.png")
+    #encode
+    latent = vq_model.get_quant(x)
+    print("latent shape: ", latent.shape)
+    #decode
+    dec = vq_model.decode(latent)
+    print("dec shape: ", dec.shape)
+    save_image(dec, "factorized_VAE/reconstructed_image.png")
         
 if __name__ == "__main__":
     args = parse_args()
