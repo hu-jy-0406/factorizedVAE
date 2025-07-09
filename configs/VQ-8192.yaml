@@ -26,7 +26,7 @@ encoder_model: vit_base_patch14_dinov2.lvd142m
 decoder_model: vit_base_patch14_dinov2.lvd142m
 
 
-use_perceptual_loss: false
+use_perceptual_loss: true
 use_disc_loss: false
 use_lecam_loss: false
 use_semantic_loss: false

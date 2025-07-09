@@ -66,7 +66,7 @@ class DINOv2Encoder(nn.Module):
             # self.model.base_model.model.pos_embed.requires_grad = True
             self.model.print_trainable_parameters()
         elif tuning_method == 'lat_lora':
-            from models.peft_models.lora import LatentLoRALinear
+            from imagefolder_models.peft_models.lora import LatentLoRALinear
             config = peft.LoraConfig(target_modules=r".*\.mlp\.fc\d|.*\.qkv|.*\.proj", modules_to_save=['norm'],
                                      **tuning_kwargs)
             config._register_custom_module({nn.Linear: LatentLoRALinear})
@@ -129,7 +129,7 @@ class DINOv2Encoder(nn.Module):
             # self.model.base_model.model.pos_embed.requires_grad = True
             self.model.print_trainable_parameters()
         elif tuning_method == 'lat_lora':
-            from models.peft_models.lora import LatentLoRALinear
+            from imagefolder_models.peft_models.lora import LatentLoRALinear
             config = peft.LoraConfig(target_modules=r".*\.mlp\.fc\d|.*\.qkv|.*\.proj", modules_to_save=['norm'],
                                      **tuning_kwargs)
             config._register_custom_module({nn.Linear: LatentLoRALinear})

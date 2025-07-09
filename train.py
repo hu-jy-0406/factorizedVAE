@@ -77,7 +77,7 @@ def build_everything(args: arg_util.Args):
     
     # build models
     from torch.nn.parallel import DistributedDataParallel as DDP
-    from models import VAR, VQVAE, build_vae_var
+    from imagefolder_models import VAR, VQVAE, build_vae_var
     from trainer import VARTrainer
     from utils.amp_sc import AmpOptimizer
     from utils.lr_control import filter_params

@@ -9,7 +9,7 @@ import PIL.Image as PImage, PIL.ImageDraw as PImageDraw
 from utils import arg_util, misc
 setattr(torch.nn.Linear, 'reset_parameters', lambda self: None)     # disable default parameter init for faster speed
 setattr(torch.nn.LayerNorm, 'reset_parameters', lambda self: None)  # disable default parameter init for faster speed
-from models import build_vae_var
+from imagefolder_models import build_vae_var
 from utils.data import build_dataset
 from torch.utils.data import DataLoader
 from utils.data_sampler import EvalDistributedSampler

@@ -10,7 +10,7 @@ import torchvision
 
 import numpy as np
 import dist
-from models import VAR, VQVAE, VectorQuantizer2
+from imagefolder_models import VAR, VQVAE, VectorQuantizer2
 from utils.amp_sc import AmpOptimizer
 from utils.misc import MetricLogger, TensorboardLogger
 
