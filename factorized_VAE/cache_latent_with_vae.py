@@ -70,7 +70,9 @@ quantizer.eval()
 with torch.no_grad():
     for batch in tqdm(dataloader):
         batch = batch.cuda()  # 假设使用 GPU
+        print("batch.shape:", batch.shape)
         latent, indices = quantizer(batch)
+        print("indices.shape:", indices.shape)
         #latents_recon = quantizer.indices_to_latents(indices)  # 将索引转换回 latent
         all_indices.append(indices.cpu())
 

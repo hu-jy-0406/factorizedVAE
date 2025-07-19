@@ -25,7 +25,7 @@ from tokenizer.tokenizer_image.lpips import LPIPS
 # export TORCH_DISTRIBUTED_DEBUG=DETAIL
 # export PYTHONPATH=/home/hjy22/repos/ImageFolder:$PYTHONPATH
 # export PYTHONPATH=/home/renderex/causal_groups/jinyuan.hu/factorizedVAE:$PYTHONPATH
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 os.environ['PYTHONPATH'] = '/home/hjy22/repos/ImageFolder'
 os.environ['MASTER_ADDR'] = 'localhost'
 os.environ['MASTER_PORT'] = '12355'

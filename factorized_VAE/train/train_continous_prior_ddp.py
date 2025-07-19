@@ -38,11 +38,11 @@ from datetime import timedelta
 
 # export PYTHONPATH=/home/renderex/causal_groups/jinyuan.hu/factorizedVAE:$PYTHONPATH
 #os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6"
-os.environ["CUDA_VISIBLE_DEVICES"] = "1,6" # Using one GPU for debugging
+os.environ["CUDA_VISIBLE_DEVICES"] = "1" # Using one GPU for debugging
 os.environ['MASTER_ADDR'] = 'localhost'
 os.environ['MASTER_PORT'] = '12355'
 
-os.environ["WANDB_MODE"] = "disabled"
+#os.environ["WANDB_MODE"] = "disabled"
 
 # def setup(rank, world_size):
 #     """
@@ -209,9 +209,9 @@ def main(rank, world_size):
     print(f"Loaded latents dataset shape: {latents.shape}")
     
     #---------- Load Test Dataset ----------#
-    test_dataset = [dataset[1], dataset[2], dataset[3], dataset[4], dataset[5], dataset[6]]
-    test_sampler = torch.utils.data.distributed.DistributedSampler(test_dataset, num_replicas=world_size, rank=rank, shuffle=False)
-    loader = DataLoader(test_dataset, batch_size=3, sampler=test_sampler, num_workers=0, pin_memory=True)
+    # test_dataset = [dataset[1], dataset[2], dataset[3], dataset[4], dataset[5], dataset[6]]
+    # test_sampler = torch.utils.data.distributed.DistributedSampler(test_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+    # loader = DataLoader(test_dataset, batch_size=3, sampler=test_sampler, num_workers=0, pin_memory=True)
        
     #----------Load DiscretePrior----------#
     vocab_size = 65536  # set this to match your codebook size
@@ -240,8 +240,8 @@ def main(rank, world_size):
     lr = 1e-4
     epochs = 100
     vis_every = 1
-    vis_num = 3
-    save_every = 500
+    vis_num = 4
+    save_every = 1
     
     # ---------- Optimizer ----------#
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-2)
@@ -310,7 +310,7 @@ def main(rank, world_size):
                 "model": model.module.state_dict(),
                 "optimizer": optimizer.state_dict(),
             }
-            ckpt_path = f"factorized_VAE/ContinousPrior/ContinousPrior_disweight_ploss_epoch{epoch+1}.pth"
+            ckpt_path = f"factorized_VAE/ContinousPrior/ContinousPrior_ploss_epoch{epoch+1}.pth"
             torch.save(ckpt_state, ckpt_path)
             print(f"Checkpoint saved to {ckpt_path}")
     print("Training complete.")

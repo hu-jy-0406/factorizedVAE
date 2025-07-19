@@ -27,7 +27,7 @@ os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "1"
 os.environ["NCCL_TIMEOUT"] = "300"
 
 #export PYTHONPATH=/home/renderex/causal_groups/jinyuan.hu/factorizedVAE:$PYTHONPATH
-os.environ["CUDA_VISIBLE_DEVICES"] = "2,3,4,5,6"  # Set visible GPUs for DDP
+os.environ["CUDA_VISIBLE_DEVICES"] = "3,4,5,6"  # Set visible GPUs for DDP
 os.environ['MASTER_ADDR'] = 'localhost'
 os.environ['MASTER_PORT'] = '12348'  # Set master port for DDP
 #os.environ["WANDB_MODE"] = "disabled"
@@ -90,7 +90,7 @@ def main(rank, world_size):
     data = torch.load(path)
     dataset = TensorDataset(data)
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
-    batch_size = 100  # Set batch size for DataLoader
+    batch_size = 64  # Set batch size for DataLoader
     loader = DataLoader(dataset, batch_size=batch_size, sampler=sampler)
     
     #---------- Load Test Dataset ----------#
@@ -118,7 +118,7 @@ def main(rank, world_size):
     epochs = 8000
     vis_every = 100
     vis_num = 6
-    save_every = 100  # Save checkpoint every 500 epochs
+    save_every = 50  # Save checkpoint every 500 epochs
     
     #---------- Optimizer and Loss ----------#
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-2)
@@ -210,7 +210,7 @@ def main(rank, world_size):
                 logger.log({"Fitting Results": wandb.Image(combined_image_fit)}, step=global_step)
                 # Save the combined image
                 save_path = f"factorized_VAE/images/discrete_prior_fitting_res.png"
-                save_image(combined_grid, save_path, normalize=False) 
+                save_image(combined_grid_fit, save_path, normalize=False) 
                 
                 # --------------- Visualize Generated Samples --------------- #
                 gen_indices = model.module.generate(num_samples=vis_num)

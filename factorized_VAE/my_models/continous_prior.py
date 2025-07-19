@@ -76,7 +76,7 @@ class ContinousPrior(nn.Module):
             context_pos = self.pos_emb(context_proj)  # (B, i+1, d_model)
             
             # Get memory for position i
-            mem_i = x[:, i+1:i+2, :].unsqueeze(2).permute(0,3,1,2)  # (B, 1, z_dim)
+            mem_i = x[:, i+1:i+2, :].unsqueeze(2).permute(0,3,1,2)  # from (B, 1, z_dim) to (B, z_dim, 1, 1)
             mem_i,_ = self.quantizer.forward(mem_i) # Quantize memory token
             mem_i = mem_i.permute(0,2,3,1)
             mem_i = mem_i.squeeze(2).detach()

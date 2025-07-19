@@ -68,11 +68,25 @@ class LFQ_model(nn.Module):
         return self.vae.decode(z)
     
     def reconstruct(self, x):
+        '''
+        reconstruct with quantized latent
+        '''
         posterior = self.vae.encode(x) #x.shape = (batch_size, 3, 256, 256)
         z = posterior.mean
         z_q, _ = self.quantizer(z)
         x_recon = self.vae.decode(z_q)
         return x_recon
+    
+    def get_indices(self, x):
+        '''
+        get quantized indices from input image x
+        x.shape = (batch_size, 3, 256, 256)
+        indices.shape = (batch_size, 16, 16)
+        '''
+        posterior = self.vae.encode(x) #x.shape = (batch_size, 3, 256, 256)
+        z = posterior.mean
+        _, indices = self.quantizer(z)
+        return indices        
         
     def forward(self, x):
         '''

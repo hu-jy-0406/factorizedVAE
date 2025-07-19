@@ -12,6 +12,7 @@ from torchvision.utils import save_image
 from factorized_VAE.my_models.lfq import LFQ_model
 from factorized_VAE.my_models.autoencoder import VQModelInterface
 import factorized_VAE.my_models.autoencoder as autoencoder
+from factorized_VAE.my_models.fvae import FVAE
 from evaluator import Evaluator
 import torch.multiprocessing as mp
 from tqdm import tqdm
@@ -21,13 +22,13 @@ import random
 from datetime import timedelta
 from imagefolder_models.vae import AutoencoderKL
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2,3"
 os.environ['MASTER_ADDR'] = 'localhost'
-os.environ['MASTER_PORT'] = '13446'
+os.environ['MASTER_PORT'] = '23446'
 
 def main(rank, world_size):
     
-    model_type = "kl-8"
+    model_type = "fvae"
     
     num_samples = 60000
     
@@ -42,7 +43,7 @@ def main(rank, world_size):
     
     if model_type == "lfq_vae":
         model = LFQ_model()
-        ckpt_path = "factorized_VAE/ckpts/lfq_vae/lfq_vae_epoch10.pth"
+        ckpt_path = "/home/renderex/causal_groups/jinyuan.hu/ckpts/lfq_vae/lfq_vae_epoch10.pth"
         ckpt = torch.load(ckpt_path)
         model.load_state_dict(ckpt['model'])
         recon_save_path = "/home/renderex/causal_groups/jinyuan.hu/CIFAR10-recon-lfq-vae"
@@ -50,9 +51,9 @@ def main(rank, world_size):
         model = AutoencoderKL(embed_dim=16, ch_mult=(1, 1, 2, 2, 4), ckpt_path="/home/renderex/causal_groups/jinyuan.hu/mar/pretrained_models/vae/kl16.ckpt").cuda().eval()
         recon_save_path = "/home/renderex/causal_groups/jinyuan.hu/CIFAR10-recon-kl-16"
     #TODO#
-    elif model_type == "kl-8":
-        config_path = "factorized_VAE/ckpts/first_stage_models/kl-f8/config.yaml"
-        ckpt_path = "factorized_VAE/ckpts/first_stage_models/kl-f8/model.ckpt"
+    elif model_type == "kl-f8":
+        config_path = "/home/renderex/causal_groups/jinyuan.hu/ckpts/first_stage_models/kl-f8/config.yaml"
+        ckpt_path = "/home/renderex/causal_groups/jinyuan.hu/ckpts/first_stage_models/kl-f8/model.ckpt"
         with open(config_path, "r") as f:
             config = yaml.safe_load(f)
         ddconfig = config["model"]["params"]["ddconfig"]
@@ -88,11 +89,19 @@ def main(rank, world_size):
         )
         #重建图像存储路径
         recon_save_path = "/home/renderex/causal_groups/jinyuan.hu/CIFAR10-recon-vq-f8"
+    elif model_type == "fvae":
+        model = FVAE()
+        ckpt_path = "/home/renderex/causal_groups/jinyuan.hu/ckpts/fvae/full/fvae_full_latent_loss+epoch10.pth"
+        ckpt = torch.load(ckpt_path)
+        model.load_state_dict(ckpt['model'])
+        recon_save_path = "/home/renderex/causal_groups/jinyuan.hu/CIFAR10-recon-fvae_latent_loss"
+    else:
+        raise ValueError(f"Unknown model type: {model_type}")
     
-    upsampled_save_path = "/home/renderex/causal_groups/jinyuan.hu/CIFAR10-256-full"
-    os.makedirs(upsampled_save_path, exist_ok=True)
+    #upsampled_save_path = "/home/renderex/causal_groups/jinyuan.hu/CIFAR10-256-full"
+    #os.makedirs(upsampled_save_path, exist_ok=True)
     os.makedirs(recon_save_path, exist_ok=True)
-    print(f"Saving upsampled images to {upsampled_save_path}")
+    #print(f"Saving upsampled images to {upsampled_save_path}")
     print(f"Saving recon images to {recon_save_path}")
     
     
@@ -123,36 +132,41 @@ def main(rank, world_size):
     
     
     samples = []
+    total = 0
     
     for x, _ in tqdm(loader, disable=not rank == 0):
         with torch.no_grad():
             x = x.to(device, non_blocking=True)
+            
             sample = model.module.reconstruct(x)
+            
+            # #x.shape = (batch_size, 3, 256, 256)
+            # indices = model.module.get_indices(x)
+            # #indices.shape = (batch_size, 16, 16)            
             
             # # resize to 32x32
             # resize_to_32 = transforms.Resize((32, 32))
             # sample = resize_to_32(sample)
             
-            samples.append(sample.cpu())
+            #samples.append(sample.cpu())
             
-            # 修改图像存储路径
-            # for i in range(sample.shape[0]):
-            #     #save_image(x[i:i+1], os.path.join(upsampled_save_path, f"gt_rank{rank}_{total + i}.png"), normalize=True, value_range=(-1, 1))
-            #     save_image(sample[i:i+1], os.path.join(recon_save_path, f"recon_rank{rank}_{total + i}.png"), normalize=True, value_range=(-1, 1))
+            for i in range(sample.shape[0]):
+                #save_image(x[i:i+1], os.path.join(upsampled_save_path, f"gt_rank{rank}_{total + i}.png"), normalize=True, value_range=(-1, 1))
+                save_image(sample[i:i+1], os.path.join(recon_save_path, f"recon_rank{rank}_{total + i}.png"), normalize=True, value_range=(-1, 1))
             
-            #total += sample.shape[0]
+            total += sample.shape[0]
     
-    samples = torch.cat(samples, dim=0)
-    total = 0
-    for i in tqdm(range(samples.shape[0]), desc="Saving images"):
-        # gt_path = os.path.join(upsampled_save_path, f"gt_rank{rank}_{total + i}.png")
-        recon_path = os.path.join(recon_save_path, f"recon_{total + i}.png")
+    # samples = torch.cat(samples, dim=0)
+    # total = 0
+    # for i in tqdm(range(samples.shape[0]), desc="Saving images"):
+    #     # gt_path = os.path.join(upsampled_save_path, f"gt_rank{rank}_{total + i}.png")
+    #     recon_path = os.path.join(recon_save_path, f"recon_{total + i}.png")
         
-        # 保存 Ground Truth 图像
-        # save_image(x[i:i+1], gt_path, normalize=True, value_range=(-1, 1))
+    #     # 保存 Ground Truth 图像
+    #     #save_image(x[i:i+1], gt_path, normalize=True, value_range=(-1, 1))
         
-        # 保存重建图像
-        save_image(samples[i:i+1], recon_path, normalize=True, value_range=(-1, 1))
+    #     # 保存重建图像
+    #     save_image(samples[i:i+1], recon_path, normalize=True, value_range=(-1, 1))
         
     dist.barrier()
     dist.destroy_process_group()

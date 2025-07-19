@@ -1,10 +1,12 @@
+from pydoc import visiblename
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from factorized_VAE.my_models.fvae_self_implemented import FVAE
+#from factorized_VAE.my_models.fvae_self_implemented import FVAE_self_implemented
+from factorized_VAE.my_models.fvae import FVAE
 from torchvision import datasets, transforms
 from torchvision.datasets import ImageFolder
-from torchvision.utils import make_grid
+from torchvision.utils import make_grid, save_image
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -13,10 +15,15 @@ import os
 import wandb
 import numpy as np
 from datetime import datetime
+from tokenizer.tokenizer_image.lpips import LPIPS
+#import mse loss
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "4,5,6"  # Set visible GPUs for DDP
+
+#export PYTHONPATH=/home/renderex/causal_groups/jinyuan.hu/factorizedVAE:$PYTHONPATH
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "6"  # Set visible GPUs for DDP
 os.environ['MASTER_ADDR'] = 'localhost'
-os.environ['MASTER_PORT'] = '12345'
+os.environ['MASTER_PORT'] = '12349'
 #os.environ["WANDB_MODE"] = "disabled"
 
 def main(rank, world_size):
@@ -35,7 +42,7 @@ def main(rank, world_size):
     print(f"Rank: {rank}, Device: {device}")
     
     #---------- Load Dataset ----------#
-    batch_size = 20
+    batch_size = 8
     transform = transforms.Compose([
         transforms.Resize((256, 256)),
         transforms.ToTensor(),
@@ -46,20 +53,38 @@ def main(rank, world_size):
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
     loader = DataLoader(dataset, batch_size=batch_size, sampler=sampler)
     
+    #---------- Load Test Dataset ----------#
+    batch_size = 4
+    test_dataset = [dataset[1], dataset[2], dataset[3], dataset[4]]  # Use a small subset for testing
+    test_sampler = torch.utils.data.distributed.DistributedSampler(test_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+    loader = DataLoader(test_dataset, batch_size=batch_size, sampler=test_sampler, num_workers=0, pin_memory=True)
+    
     #---------- Initialize FVAE ----------#
-    model = FVAE("/home/renderex/causal_groups/jinyuan.hu/mar/pretrained_models/vae/kl16.ckpt").to(device)
-    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    # model = FVAE_self_implemented("/home/renderex/causal_groups/jinyuan.hu/mar/pretrained_models/vae/kl16.ckpt").to(device)
+    # total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    model = FVAE()
     model = DDP(model, device_ids=[rank], output_device=rank)
     
     #--------Hyperparameters----------#
-    lr = 2e-4
-    epochs = 2
-    save_every = 10
-    vis_every = 1
+    
+    #for train
+    # lr = 5e-4
+    # epochs = 10
+    # save_every = 5
+    # vis_every = 1
+    # vis_num = 8
+    
+    # for test
+    lr = 5e-4
+    epochs = 10000
+    save_every = 10000
+    vis_every = 100
     vis_num = 4
     
-    #---------- Optimizer ----------#
+    #---------- Optimizer and Loss----------#
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-2)
+    mse_loss_func = torch.nn.MSELoss()
+    ploss_func = LPIPS().cuda().eval()
     
     #---------- Load ckpt ----------#
     resume_path = None
@@ -81,13 +106,13 @@ def main(rank, world_size):
         wandb.login(key="3761ca3994faa9fea7e291585ce72a0ed49562a0")
         logger = wandb.init(project="FVAE",
                             name=str(datetime.now().strftime('%Y.%m.%d-%H.%M.%S'))+f"rank-{rank}")
-        #log total parameters
-        logger.config.update({
-            "total_params": total_params,
-            "vocab_size": model.module.codebook_size,
-            "batch_size": batch_size,
-            "epochs": epochs
-        })
+        # #log total parameters
+        # logger.config.update({
+        #     "total_params": total_params,
+        #     "vocab_size": model.module.codebook_size,
+        #     "batch_size": batch_size,
+        #     "epochs": epochs
+        # })
         
     #---------- Training Loop ----------#
     model.train()
@@ -98,8 +123,12 @@ def main(rank, world_size):
         total_loss = 0.0
         for batch in pbar:
             batch = batch[0].to(device)#batch shape = (batch_size, 3, 256, 256)
-            codebook_loss, recon_loss, ploss, z_q, x_recon, perplexity = model(batch)
-            loss = codebook_loss + recon_loss + ploss
+            dec, latent_loss = model(batch)
+            recon_loss = mse_loss_func(dec, batch)  # Reconstruction loss
+            ploss = ploss_func(dec, batch).mean()  # Perceptual loss
+            #loss = recon_loss + ploss + latent_loss
+            loss = recon_loss + latent_loss
+            #loss = latent_loss
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -108,17 +137,17 @@ def main(rank, world_size):
             global_step += 1
             if rank == 0:
                 logger.log({"batch_total_loss": loss.item()}, step=global_step)
-                logger.log({"batch_codebook_loss": codebook_loss.item()}, step=global_step)
+                logger.log({"batch_latent_loss": latent_loss.item()}, step=global_step)
                 logger.log({"batch_recon_loss": recon_loss.item()}, step=global_step)
                 logger.log({"batch_ploss": ploss.item()}, step=global_step)
-                logger.log({"batch_perplexity": perplexity.item()}, step=global_step)
                 logger.log({"epoch": epoch + 1}, step=global_step)
         
         # Visualize reconstructions every vis_every epochs
         if rank == 0 and (epoch + 1) % vis_every == 0:
             model.eval()
             with torch.no_grad():
-                codebook_loss, recon_loss, ploss, z_q, x_recon, perplexity = model(batch)
+                # codebook_loss, recon_loss, ploss, z_q, x_recon, perplexity = model(batch)
+                x_recon, _ = model(batch)
                 # x_norm = normalize_image(batch)
                 # x_recon_norm = normalize_image(x_recon)
                 recon_grid = make_grid(x_recon[:vis_num], nrow=vis_num, normalize=True, value_range=(-1, 1))
@@ -128,6 +157,8 @@ def main(rank, world_size):
                 combined_image = combined_grid.permute(1, 2, 0).cpu().numpy()  # (C, H, W) -> (H, W, C)
                 combined_image = (combined_image * 255).astype(np.uint8)  # 转换为 [0, 255] 范围的 uint8 格式
                 logger.log({"Reconstruction Comparison": wandb.Image(combined_image)}, step=global_step)
+                # save_path = "/home/renderex/causal_groups/jinyuan.hu/factorizedVAE/factorized_VAE/images/fvae_recon.png"
+                # save_image(combined_grid, save_path, normalize=False)
             model.train()
         
         # Save checkpoint
@@ -138,7 +169,7 @@ def main(rank, world_size):
                 "model": model.module.state_dict(),
                 "optimizer": optimizer.state_dict(),
             }
-            ckpt_path = f"factorized_VAE/fvae_epoch{epoch+1}.pth"
+            ckpt_path = f"/home/renderex/causal_groups/jinyuan.hu/ckpts/fvae/test/fvae_full_2loss+epoch{epoch+1}.pth"
             torch.save(ckpt_state, ckpt_path)
             print(f"Checkpoint saved to {ckpt_path}")
             

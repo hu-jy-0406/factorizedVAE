@@ -354,6 +354,7 @@ class AutoencoderKL(pl.LightningModule):
     def reconstruct(self, x):
         posterior = self.encode(x)
         z = posterior.mean
+        #print(f"Encoded shape: {z.shape}") (128, 4, 32, 32)
         dec = self.decode(z)
         return dec
 
