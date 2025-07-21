@@ -22,3 +22,4 @@ wandb
 output
 *.npz
 *.ptfactorized_VAE/*.npy
+!LlamaGen/
