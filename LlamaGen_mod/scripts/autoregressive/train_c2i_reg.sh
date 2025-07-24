@@ -1,0 +1,43 @@
+# !/bin/bash
+set -x
+
+export CUDA_VISIBLE_DEVICES=0
+export PYTHONPATH=/home/renderex/causal_groups/jinyuan.hu/factorizedVAE:$PYTHONPATH
+export PYTORCH_SYMBOLIC_SHAPES_DISABLE_WARNINGS=1
+export TORCH_DISTRIBUTED_DEBUG=INFO
+
+export WANDB_MODE=disabled
+
+# torchrun \
+# --nnodes=$nnodes --nproc_per_node=$nproc_per_node --node_rank=$node_rank \
+# --master_addr=$master_addr --master_port=$master_port \
+# autoregressive/train/train_c2i.py "$@"
+
+torchrun \
+--nnodes=1 --nproc_per_node=1 --node_rank=0 \
+--master_port=12359 \
+autoregressive/train/train_c2i_reg.py \
+--dataset cifar10_code \
+--train-code-path /mnt/disk3/jinyuan/CIFAR10-latent/fvae/train \
+--val-code-path /mnt/disk3/jinyuan/CIFAR10-latent/fvae/val \
+--image-size 256 \
+--num-classes 10 \
+--cfg-scale 2.0 \
+--global-batch-size 4 \
+--vis-num 4 \
+--epochs 50 \
+--log-every 10 \
+--vis-every 10 \
+--val-every 10000 \
+--ckpt-every 1000 \
+--no-local-save \
+--cloud-save-path /mnt/disk3/jinyuan/ckpts/lamma_gen/test \
+--gpt-ckpt /mnt/disk3/jinyuan/ckpts/lamma_gen/ar/pretrain_cifar10/2025-07-23-10-09-38/025-GPT-B/checkpoints/0001000.pt \
+# --gpt-reg-ckpt /mnt/disk3/jinyuan/ckpts/lamma_gen/test/2025-07-23-17-44-35/046-GPT-Reg-B/checkpoints/0005000.pt
+
+# --gpt-ckpt /mnt/disk3/jinyuan/ckpts/lamma_gen/test/2025-07-23-14-12-26/035-GPT-Reg-B/checkpoints/0001000.pt
+
+# global-batch-size must be greater than 1
+# otherwise GroupNorm will fail
+
+#--gpt-ckpt /mnt/disk3/jinyuan/ckpts/lamma_gen/ar_reg/cifar10/2025-07-22-19-31-08/018-GPT-Reg-B/checkpoints/0003200.pt \
