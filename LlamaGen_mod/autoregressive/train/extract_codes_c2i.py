@@ -12,10 +12,10 @@ import argparse
 import os
 import yaml
 
-from LlamaGen.utils.distributed import init_distributed_mode
-from LlamaGen.dataset.augmentation import center_crop_arr
-from LlamaGen.dataset.build import build_dataset
-from LlamaGen.tokenizer.tokenizer_image.vq_model import VQ_models
+from LlamaGen_mod.utils.distributed import init_distributed_mode
+from LlamaGen_mod.dataset.augmentation import center_crop_arr
+from LlamaGen_mod.dataset.build import build_dataset
+from LlamaGen_mod.tokenizer.tokenizer_image.vq_model import VQ_models
 
 from factorized_VAE.my_models.lfq import LFQ_model
 from imagefolder_models.vae import AutoencoderKL
@@ -60,16 +60,16 @@ def main(args):
     model_type = args.modeltype
     if model_type == "lfq_vae":
         model = LFQ_model()
-        ckpt_path = "/home/renderex/causal_groups/jinyuan.hu/ckpts/lfq_vae/lfq_vae_epoch10.pth"
+        ckpt_path = "/mnt/disk3/jinyuan/ckpts/lfq_vae/lfq_vae_epoch10.pth"
         ckpt = torch.load(ckpt_path)
         model.load_state_dict(ckpt['model'])
-        recon_save_path = "/home/renderex/causal_groups/jinyuan.hu/CIFAR10-recon-lfq-vae"
+        recon_save_path = "/mnt/disk3/jinyuan/CIFAR10-recon-lfq-vae"
     elif model_type == "kl-16":
         model = AutoencoderKL(embed_dim=16, ch_mult=(1, 1, 2, 2, 4), ckpt_path="/home/renderex/causal_groups/jinyuan.hu/mar/pretrained_models/vae/kl16.ckpt").cuda().eval()
-        recon_save_path = "/home/renderex/causal_groups/jinyuan.hu/CIFAR10-recon-kl-16"
+        recon_save_path = "/mnt/disk3/jinyuan/CIFAR10-recon-kl-16"
     elif model_type == "fvae":
         model = FVAE()
-        ckpt_path = "/home/renderex/causal_groups/jinyuan.hu/ckpts/fvae/full/fvae_full_3loss+epoch10.pth"
+        ckpt_path = "/mnt/disk3/jinyuan/ckpts/fvae/full/fvae_full_3loss+epoch10.pth"
         ckpt = torch.load(ckpt_path)
         model.load_state_dict(ckpt["model"])
     #TODO#
@@ -173,9 +173,10 @@ def main(args):
         # --------------------------------- #
         
         with torch.no_grad():
+            print("x_all.shape:", x_all.shape)
             indices = model.get_indices_from_images(x_all)
             # reshape indices from (1, 16, 16) to (256)
-            indices = indices.reshape(-1)        
+            print("indices.shape:", indices.shape)       
             
         
         codes = indices.reshape(x.shape[0], num_aug, -1)

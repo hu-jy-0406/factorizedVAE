@@ -11,7 +11,7 @@ from typing import Optional, List
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from LlamaGen.utils.drop_path import DropPath
+from LlamaGen_mod.utils.drop_path import DropPath
 
 
 def find_multiple(n: int, k: int):
@@ -315,6 +315,7 @@ class TransformerBlock(nn.Module):
         self.ffn_norm = RMSNorm(config.dim, eps=config.norm_eps)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         
+        self.test_linear = nn.Linear(2 * config.dim, config.dim, bias=True)  # for testing purposes
         # self.test_linear = nn.Linear(config.dim, config.dim, bias=True)  # for testing purposes
 
     # def forward(
@@ -330,7 +331,12 @@ class TransformerBlock(nn.Module):
         else:
             # x_attn = x + self.attention(self.attention_norm(x), freqs_cis, start_pos, mask)
             # h = x + self.drop_path(self.cross_attention(self.attention_norm(x_attn), self.attention_norm(mem), freqs_cis, start_pos, mask))
-            h = x + self.drop_path(self.attention(self.attention_norm(x), freqs_cis, start_pos, mask)+mem)
+            h = x + self.drop_path(
+                self.test_linear(
+                    torch.cat((self.attention(self.attention_norm(x), freqs_cis, start_pos, mask),mem), 
+                    dim=-1)
+                )
+            )
         out = h + self.drop_path(self.feed_forward(self.ffn_norm(h)))
         return out
 

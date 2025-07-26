@@ -14,9 +14,9 @@ import numpy as np
 import math
 import argparse
 
-from LlamaGen.tokenizer.tokenizer_image.vq_model import VQ_models
-from LlamaGen.autoregressive.models.gpt import GPT_models
-from LlamaGen.autoregressive.models.generate import generate
+from LlamaGen_mod.tokenizer.tokenizer_image.vq_model import VQ_models
+from LlamaGen_mod.autoregressive.models.gpt import GPT_models
+from LlamaGen_mod.autoregressive.models.generate import generate
 
 from factorized_VAE.my_models.fvae import FVAE
 

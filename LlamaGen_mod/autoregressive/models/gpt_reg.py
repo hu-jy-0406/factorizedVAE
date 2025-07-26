@@ -4,7 +4,7 @@ from doctest import OutputChecker
 import torch
 from torch import Tensor
 from torch.nn import Dropout, Linear, MSELoss
-from LlamaGen.autoregressive.models.gpt import TransformerBlock, Transformer, ModelArgs, CrossAttention
+from LlamaGen_mod.autoregressive.models.gpt import TransformerBlock, Transformer, ModelArgs, CrossAttention
 from factorized_VAE.my_models.fvae import FVAE
 from tokenizer.tokenizer_image.lpips import LPIPS
 from typing import Optional
@@ -40,8 +40,12 @@ class TransformerReg(Transformer):
         super().__init__(config)
         
         self.fvae = FVAE()
+        ckpt_path = "/mnt/disk3/jinyuan/ckpts/fvae/full/fvae_full_3loss+epoch10.pth"
+        ckpt = torch.load(ckpt_path)
+        self.fvae.load_state_dict(ckpt["model"])    
         for param in self.fvae.parameters():
             param.requires_grad = False
+        del ckpt
         
         del self.tok_embeddings   
         self.input_proj = Linear(self.fvae.kl.embed_dim, config.dim)
@@ -77,6 +81,8 @@ class TransformerReg(Transformer):
         mask: Optional[torch.Tensor] = None
     ):
         
+        mem = mem.detach()
+
         if codes is not None and cond_idx is not None:
             # codes.shape=(bs, 256, 16)
             cond_embeddings = self.cls_embedding(cond_idx, train=self.training)[:,:self.cls_token_num] #(bs, 1, 768)
@@ -158,22 +164,29 @@ class TransformerReg(Transformer):
         predictions = self.output_proj(h)
         
         if targets is not None:
-            mse_loss = self.mse_loss(predictions, targets)
+            code_loss = self.mse_loss(predictions, targets)
         
             w = int(np.sqrt(l))
+
             predictions = predictions.reshape(b, w, w, -1).permute(0, 3, 1, 2)
             pred_dec = self.fvae.kl.decode(predictions)
+
+            
             gt = targets.reshape(b, w, w, -1).permute(0, 3, 1, 2)
             gt_dec = self.fvae.kl.decode(gt)
+
+            mem = mem.reshape(b, w, w, -1).permute(0, 3, 1, 2)
+            mem_dec = self.fvae.vq.decode(mem)
         
-        
+            img_loss = self.mse_loss(pred_dec, gt_dec)  # Calculate image reconstruction loss
+
             if self.use_perceptual_loss:
                 ploss = self.perceptual_loss(gt_dec, pred_dec).mean()  # Calculate perceptual loss
                 ploss = self.perceptual_weight * ploss  # Add perceptual loss to the
             else:
                 ploss = torch.tensor(0.0)
                 
-            return predictions, mse_loss, ploss, gt_dec, pred_dec
+            return predictions, code_loss, img_loss, ploss, gt_dec, pred_dec
         
         else:
             return predictions

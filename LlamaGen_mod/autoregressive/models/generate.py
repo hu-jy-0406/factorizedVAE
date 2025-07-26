@@ -92,6 +92,7 @@ def prefill_continous_code(model, cond_idx: torch.Tensor, mem: torch.Tensor, inp
         # cond_idx.shape = (64)
         # mem.shape = (32, 1, 16, 16)
         # input_pos.shape = (1)
+        #print("cond_idx.shape:", cond_idx.shape, "mem.shape:", mem.shape)
         logits = model(codes=None, cond_idx=cond_idx, mem=mem, input_pos=input_pos)
         logits_combined = logits
         cond_logits, uncond_logits = torch.split(logits_combined, len(logits_combined) // 2, dim=0)
@@ -147,12 +148,47 @@ def decode_n_tokens(
             next_token, next_prob = decode_one_token(
                 model, cur_token, input_pos, cfg_scale, cfg_flag, **sampling_kwargs
             )
-            input_pos = torch.tensor(input_pos + 1)
+            input_pos = input_pos + 1
             new_tokens.append(next_token.clone())
             new_probs.append(next_prob.clone())
             cur_token = next_token.view(-1, 1)
     
     return new_tokens, new_probs
+
+
+def decode_given_m_tokens(
+    model, 
+    given_tokens: torch.Tensor,  
+    input_pos: torch.Tensor, 
+    num_new_tokens: int,
+    cfg_scale: float, 
+    cfg_interval: int, 
+    **sampling_kwargs):
+    #print("given_tokens.shape:", given_tokens.shape)
+    given_tokens_num = given_tokens.shape[1]
+    #print("num of tokens given:", given_tokens_num)
+    new_tokens = []
+    cfg_flag = True
+    cur_token = given_tokens[:, :1]
+    #print("given_tokens.shape:", given_tokens.shape)# given_tokens.shape = (4, 255)
+    #print("num_new_tokens:", num_new_tokens)# num_new_tokens = 255
+    for i in range(num_new_tokens):
+        with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True):
+            if cfg_scale > -1 and i > cfg_interval:
+                cfg_flag = False
+            '''
+            i = 0, given gt_token_1, decode gen_token_2
+            '''
+            next_token, _ = decode_one_token(
+                model, cur_token, input_pos, cfg_scale, cfg_flag, **sampling_kwargs
+            )
+            input_pos = input_pos + 1
+            if i < given_tokens_num - 1:
+                next_token = given_tokens[:, i+1:i+2]
+            new_tokens.append(next_token.clone())
+            cur_token = next_token.view(-1, 1)
+    return new_tokens            
+
 
 def decode_n_codes(
     model, cur_code: torch.Tensor, mem: torch.Tensor, input_pos: torch.Tensor, num_new_codes: int, 
@@ -172,13 +208,14 @@ def decode_n_codes(
             next_code = decode_one_code(
                 model, cur_code, mem[:, i:i+1, :] if mem is not None else None,
                 input_pos, cfg_scale, cfg_flag)
-            input_pos = torch.tensor(input_pos + 1)
+            input_pos = input_pos + 1
             new_codes.append(next_code.clone())
             cur_code = next_code # todo: change shape
     return new_codes
 
 @torch.no_grad()
-def generate(model, cond, max_new_tokens, emb_masks=None, cfg_scale=1.0, cfg_interval=-1, **sampling_kwargs):
+def generate(model, cond, max_new_tokens, emb_masks=None, 
+            cfg_scale=1.0, cfg_interval=-1, **sampling_kwargs):
     if model.model_type == 'c2i':
         if cfg_scale > 1.0:
             cond_null = torch.ones_like(cond) * model.num_classes
@@ -224,13 +261,85 @@ def generate(model, cond, max_new_tokens, emb_masks=None, cfg_scale=1.0, cfg_int
     seq[:, T:T+1] = next_token
 
     input_pos = torch.tensor([T], device=device, dtype=torch.int)
-    print("type(input_pos):", type(input_pos), "input_pos:", input_pos)
+    #print("type(input_pos):", type(input_pos), "input_pos:", input_pos)
     generated_tokens, _ = decode_n_tokens(model, next_token, input_pos, max_new_tokens-1, cfg_scale, cfg_interval, **sampling_kwargs)
     seq[:, T+1:] = torch.cat(generated_tokens, dim=1)
     
     model.del_caches()# important!
 
     return seq[:, T:]
+
+
+@torch.no_grad()
+def generate_with_given_tokens(model, cond, given_tokens, max_new_tokens, 
+                                emb_masks=None, cfg_scale=1.0, 
+                                cfg_interval=-1, **sampling_kwargs):
+    if model.model_type == 'c2i':
+        if cfg_scale > 1.0:
+            cond_null = torch.ones_like(cond) * model.num_classes
+            cond_combined = torch.cat([cond, cond_null])
+        else:
+            cond_combined = cond
+        T = 1
+    elif model.model_type == 't2i':
+        if cfg_scale > 1.0:
+            cond_null = torch.zeros_like(cond) + model.cls_embedding.uncond_embedding
+            cond_combined = torch.cat([cond, cond_null])
+        else:
+            cond_combined = cond
+        T = cond.shape[1]      
+    else:
+        raise Exception("please check model type")
+
+    T_new = T + max_new_tokens
+    max_seq_length = T_new
+    max_batch_size = cond.shape[0]
+
+    device = cond.device
+    with torch.device(device):
+        max_batch_size_cfg = max_batch_size * 2 if cfg_scale > 1.0 else max_batch_size
+        model.setup_caches(max_batch_size=max_batch_size_cfg, max_seq_length=max_seq_length, dtype=model.tok_embeddings.weight.dtype)
+    
+    if emb_masks is not None:
+        assert emb_masks.shape[0] == max_batch_size
+        assert emb_masks.shape[-1] == T
+        if cfg_scale > 1.0:
+            model.causal_mask[:, :, :T] = model.causal_mask[:, :, :T] * torch.cat([emb_masks, emb_masks]).unsqueeze(1)
+        else:
+            model.causal_mask[:, :, :T] = model.causal_mask[:, :, :T] * emb_masks.unsqueeze(1)
+
+        eye_matrix = torch.eye(model.causal_mask.size(1), model.causal_mask.size(2), device=device)
+        model.causal_mask[:] = model.causal_mask * (1 - eye_matrix) + eye_matrix
+    
+    # create an empty tensor of the expected final shape and fill in the current tokens
+    seq = torch.empty((max_batch_size, T_new), dtype=torch.int, device=device)
+
+    input_pos = torch.arange(0, T, device=device)
+    next_token = prefill(model, cond_combined, input_pos, cfg_scale, **sampling_kwargs)
+    seq[:, T:T+1] = given_tokens[:, :1] if given_tokens is not None else next_token
+
+    input_pos = torch.tensor([T], device=device, dtype=torch.int)
+    #print("type(input_pos):", type(input_pos), "input_pos:", input_pos), Tensor, 1
+    #generated_tokens, _ = decode_n_tokens(model, next_token, input_pos, max_new_tokens-1, cfg_scale, cfg_interval, **sampling_kwargs)
+    generated_tokens = decode_given_m_tokens(model, given_tokens, input_pos, max_new_tokens-1, cfg_scale, cfg_interval, **sampling_kwargs)
+    # print("len(generated_tokens):", len(generated_tokens))
+    # print("max_new_tokens:", max_new_tokens-1)
+    assert len(generated_tokens) == max_new_tokens-1
+
+    # print("seq.shape:", seq.shape)
+    # print("seq[:, T:].shape:", seq[:, T:].shape)
+    # print("seq[:, T:T+1].shape:", seq[:, T:T+1].shape)
+    # print("seq[:, T+1:].shape:", seq[:, T+1:].shape)
+    # print("len(generated_tokens):", len(generated_tokens))
+    # print("generated_tokens.shape:", torch.cat(generated_tokens, dim=1).shape)
+    
+
+    seq[:, T+1:] = torch.cat(generated_tokens, dim=1)
+
+    model.del_caches()# important!
+
+    return seq[:, T:]
+
 
 def generate_continous_code(model, cond, mem, max_new_codes, emb_masks=None, cfg_scale=1.0, cfg_interval=-1):
     if model.model_type == 'c2i':
@@ -277,6 +386,8 @@ def generate_continous_code(model, cond, mem, max_new_codes, emb_masks=None, cfg
     seq = torch.empty((max_batch_size, T_new, model.fvae.kl.embed_dim), dtype=torch.float32, device=device)
     
     input_pos = torch.arange(0, T, device=device)
+    
+    #print("cond_combined.shape:", cond_combined.shape)
     next_code = prefill_continous_code(model=model, cond_idx=cond_combined, 
                                        mem=mem_combined[:, :1, :] if mem_combined is not None else None,
                                        input_pos=input_pos, cfg_scale=cfg_scale)

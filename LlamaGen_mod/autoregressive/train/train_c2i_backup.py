@@ -15,11 +15,11 @@ import time
 import inspect
 import argparse
 
-from LlamaGen.utils.logger import create_logger
-from LlamaGen.utils.distributed import init_distributed_mode
-from LlamaGen.utils.ema import update_ema, requires_grad
-from LlamaGen.dataset.build import build_dataset
-from LlamaGen.autoregressive.models.gpt import GPT_models
+from LlamaGen_mod.utils.logger import create_logger
+from LlamaGen_mod.utils.distributed import init_distributed_mode
+from LlamaGen_mod.utils.ema import update_ema, requires_grad
+from LlamaGen_mod.dataset.build import build_dataset
+from LlamaGen_mod.autoregressive.models.gpt import GPT_models
 
 
 #################################################################################

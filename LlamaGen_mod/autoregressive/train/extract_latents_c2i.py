@@ -12,10 +12,10 @@ import argparse
 import os
 import yaml
 
-from LlamaGen.utils.distributed import init_distributed_mode
-from LlamaGen.dataset.augmentation import center_crop_arr
-from LlamaGen.dataset.build import build_dataset
-from LlamaGen.tokenizer.tokenizer_image.vq_model import VQ_models
+from LlamaGen_mod.utils.distributed import init_distributed_mode
+from LlamaGen_mod.dataset.augmentation import center_crop_arr
+from LlamaGen_mod.dataset.build import build_dataset
+from LlamaGen_mod.tokenizer.tokenizer_image.vq_model import VQ_models
 
 from factorized_VAE.my_models.lfq import LFQ_model
 from imagefolder_models.vae import AutoencoderKL

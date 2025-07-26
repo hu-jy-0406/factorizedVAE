@@ -22,4 +22,4 @@ autoregressive/sample/sample_c2i_ddp.py \
 --cfg-scale 2.0 \
 --per-proc-batch-size 32 \
 --num-fid-samples 10 \
---sample-dir /home/renderex/causal_groups/jinyuan.hu/factorizedVAE/LlamaGen/samples \
+--sample-dir /home/renderex/causal_groups/jinyuan.hu/factorizedVAE/LlamaGen_mod/samples \

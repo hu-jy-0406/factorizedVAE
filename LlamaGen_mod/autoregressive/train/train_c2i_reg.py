@@ -20,14 +20,15 @@ import argparse
 import wandb
 from datetime import datetime
 import numpy as np
+import math
 
-from LlamaGen.utils.logger import create_logger
-from LlamaGen.utils.distributed import init_distributed_mode
-from LlamaGen.utils.ema import update_ema, requires_grad
-from LlamaGen.dataset.build import build_dataset
-from LlamaGen.autoregressive.models.gpt import GPT_models
-from LlamaGen.autoregressive.models.gpt_reg import GPT_Reg_models
-from LlamaGen.autoregressive.models.generate import generate, generate_continous_code
+from LlamaGen_mod.utils.logger import create_logger
+from LlamaGen_mod.utils.distributed import init_distributed_mode
+from LlamaGen_mod.utils.ema import update_ema, requires_grad
+from LlamaGen_mod.dataset.build import build_dataset
+from LlamaGen_mod.autoregressive.models.gpt import GPT_models
+from LlamaGen_mod.autoregressive.models.gpt_reg import GPT_Reg_models
+from LlamaGen_mod.autoregressive.models.generate import generate, generate_continous_code, generate_with_given_tokens
 
 import torch._dynamo
 torch._dynamo.config.suppress_errors = True #important! This prevents torch._dynamo from raising errors when it encounters unsupported operations, which can happen with certain model architectures or configurations.
@@ -62,6 +63,29 @@ def creat_optimizer(model, weight_decay, learning_rate, betas, logger):
     optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
     logger.info(f"using fused AdamW: {fused_available}")
     return optimizer
+
+def x_to_mem(x, model):
+    """
+    x.shape = b, l, z_dim
+    mem.shape = b, l, zq_dim
+    """
+    b, l, c = x.shape
+    latent_size = int(math.sqrt(l))
+    x_reshape = x.reshape(b, latent_size, latent_size, -1).permute(0, 3, 1, 2)  # (B, l, z_dim) -> (B, z_dim, latent_size, latent_size)
+    mem = model.module.fvae.get_quant_from_vae_latent(x_reshape)  # (B, z_dim, latent_size, latent_size) -> (B, zq_dim, latent_size, latent_size)
+    mem = mem.permute(0, 2, 3, 1).reshape(b, l, -1)  # (B, zq_dim, latent_size, latent_size) -> (B, l, zq_dim)
+    return mem
+
+def mem_to_img(mem, model):
+    """
+    mem.shape = b, l, zq_dim
+    img.shape = b, c, h, w
+    """
+    b, l, c = mem.shape
+    latent_size = int(math.sqrt(l))
+    mem_reshape = mem.reshape(b, latent_size, latent_size, -1).permute(0, 3, 1, 2)
+    mem_dec = model.module.fvae.vq.decode(mem_reshape)
+    return mem_dec
 
 
 
@@ -247,12 +271,18 @@ def main(args):
         start_epoch = 0
         
     logger.info(f"Initial state: steps={train_steps}, epochs={start_epoch}")
+
+    steps_per_epoch = len(vis_loader)
+    logger.info(f"Steps per epoch: {steps_per_epoch}")
+    total_steps = train_steps + (args.epochs - start_epoch) * steps_per_epoch
+    logger.info(f"Total setps: {total_steps}")
     
     if args.ema:
         update_ema(ema, gpt_reg_model, decay=0)  # Ensure EMA is initialized with synced weights
 
     if not args.no_compile:
         logger.info("compiling the model... (may take several minutes)")
+        gpt_model = torch.compile(gpt_model)  # requires PyTorch 2.0
         gpt_reg_model = torch.compile(gpt_reg_model) # requires PyTorch 2.0        
     
     gpt_reg_model = DDP(gpt_reg_model.to(device), device_ids=[args.gpu])
@@ -268,28 +298,81 @@ def main(args):
     running_loss = 0
     start_time = time.time()
 
+    
     logger.info(f"Training for {args.epochs} epochs...")
     for epoch in range(start_epoch, args.epochs):
         train_sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
-        for x, y in vis_loader:
+        
+        # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ #
+        # +++++++++++++++++++++++++ Training Loop ++++++++++++++++++++++++++ #
+        # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ #
+        for x, y in train_loader:
+
+            b, l, c = x.shape
+
             x = x.to(device, non_blocking=True) # (64, 256, 16)
             y = y.to(device, non_blocking=True) # (64)
             
-            if args.no_mem==True:
+            if args.no_mem == True:
                 print("no_mem is True, mem is None")
                 mem_gt = None
             else:
-                mem_gt = x.unsqueeze(2).permute(0,3,1,2) # from (B, 256, z_dim=16) to (B, z_dim=16, 256, 1)
-                mem_gt = gpt_reg_model.module.fvae.get_quant_from_vae_latent(mem_gt)  # (B, z_dim=16, 256, 1) -> (B, z_dim=8, 256, 1)
-                mem_gt = mem_gt.permute(0,2,3,1) # (B, 256, 1, z_dim=8)
-                mem_gt = mem_gt.squeeze(2).detach()  # (B, 256, z_dim=8)
+                mem_gt = x_to_mem(x, gpt_reg_model)  # (B, 256, z_dim=16) -> (B, 256, zq_dim=8)
+
             
+            '''
+            given part of mem_gt, generate the rest of the mem using GPT
+            use the combination of mem_gt and generated mem as the input to the GPT-Reg model
+            '''
+            #print("train_steps:", train_steps, "total_steps:", total_steps, "(train_steps+1)/total_steps:", (train_steps+1) / total_steps)
+            # gt_ratio = max(np.cos(math.pi / 2. * (train_steps + 1) / total_steps), args.min_ratio)
+            # gt_num = int(mem_gt.shape[1] * gt_ratio)
+            # logger.info(f"Ground truth tokens ratio: {gt_ratio}, Ground truth tokens num: {gt_num}")
+            # mem_gt_used = mem_gt[:, :gt_num, :].unsqueeze(1).permute(0, 3, 1, 2) #(B, gt_num, z_dim)->(B, z_dim, 1, gt_num)
+            # _, _, (_, _, token_gt_used) = gpt_reg_model.module.fvae.vq.quantize(mem_gt_used)
+            # token_gt_used = token_gt_used.reshape(b, gt_num)
+            # assert token_gt_used.shape == (b, gt_num)
+            # mix_tokens = generate_with_given_tokens(
+            #     model=gpt_model, cond=y, given_tokens=token_gt_used, max_new_tokens=latent_size ** 2,
+            #     cfg_scale=args.cfg_scale, cfg_interval=args.cfg_interval,
+            #     temperature=args.temperature, top_k=args.top_k,
+            #     top_p=args.top_p, sample_logits=True,
+            #     )
+            # assert mix_tokens[:, :gt_num].shape == token_gt_used.shape
+            # assert (mix_tokens[:, :gt_num] == token_gt_used).all()
+            # mix_tokens = torch.flatten(mix_tokens)
+            # mix_quant_code = gpt_reg_model.module.fvae.vq.quantize.get_codebook_entry(mix_tokens, shape=(b, latent_size, latent_size, -1))
+            # mix_mem = mix_quant_code.permute(0, 2, 3, 1).reshape(b, latent_size ** 2, -1)
+            # assert mix_mem.shape == mem_gt.shape
+
+            # # ------------------ visualize ------------------ #
+            # mix_code_dec = gpt_reg_model.module.fvae.vq.decode(mix_quant_code)
+            # mix_code_grid = make_grid(mix_code_dec, nrow=args.vis_num, normalize=True, value_range=(-1, 1))
+            # # ----------------------------------------------- #
+
             with torch.cuda.amp.autocast(dtype=ptdtype):  
-                _, mse_loss, ploss, _, _ = gpt_reg_model(codes=x, cond_idx=y, mem=mem_gt, targets=x)
-            loss = mse_loss + ploss
+                _, code_loss, img_loss, ploss, mem_gt_img, fit_img = gpt_reg_model(codes=x, cond_idx=y, mem=mem_gt, targets=x)
+            loss = code_loss + img_loss + ploss
+
             if rank == 0:
-                wandb_logger.log({"step_train_loss": loss.item()}, step=train_steps)         
+                wandb_logger.log({"train_loss": loss.item()}, step=train_steps)
+                wandb_logger.log({"train_code_loss": code_loss.item()}, step=train_steps)
+                wandb_logger.log({"train_img_loss": img_loss.item()}, step=train_steps)
+                wandb_logger.log({"train_ploss": ploss.item()}, step=train_steps)  
+                # Visualize fitting results
+                # gt_mem_img = gpt_reg_model.module.fvae.vq.decode(mem_gt.reshape(b, 16, 16, -1).permute(0, 3, 1, 2))
+                
+                # gt_mem_grid = make_grid(gt_mem_img, nrow=args.vis_num, normalize=True, value_range=(-1, 1))
+                
+                # mix_mem_grid = make_grid(mix_mem_img, nrow=args.vis_num, normalize=True, value_range=(-1, 1))
+                # fit_grid = make_grid(fit_img, nrow=args.vis_num, normalize=True, value_range=(-1, 1))
+                # combined_fit_grid = torch.cat((gt_mem_grid, mix_mem_grid, fit_grid), dim=1)
+                # # combined_fit_image = comb_fit_grid.permute(1, 2, 0).cpu().numpy()
+                # # combined_fit_image = (combined_fit_image * 255).astype(np.uint8)
+                # save_image(combined_fit_grid, "/home/renderex/causal_groups/jinyuan.hu/factorizedVAE/factorized_VAE/images/GPT-Reg-fit-res.png")
+                
+
             scaler.scale(loss).backward()
             if args.max_grad_norm != 0.0:
                 scaler.unscale_(optimizer)
@@ -317,50 +400,62 @@ def main(args):
                 avg_loss = avg_loss.item() / dist.get_world_size()
                 logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
                 if rank == 0:
-                    wandb_logger.log({"train_loss": avg_loss, "steps_per_sec": steps_per_sec, "epoch": epoch}, step=train_steps)
+                    wandb_logger.log({"avg_train_loss": avg_loss, "steps_per_sec": steps_per_sec, "epoch": epoch}, step=train_steps)
                 # Reset monitoring variables:
                 running_loss = 0
                 log_steps = 0
-                start_time = time.time()
+                start_time = time.time()      
+        # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ #
+        # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ #
+        # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ #
             
-            # Evaluation    
-            # if train_steps % args.val_every == 0 and train_steps > 0:
-            #     logger.info(f"Begining evaluation at step{train_steps}, epoch{epoch}")
-            #     model.eval()#这里不能加model.eval()，加之后model.forward()会报错
-            #     val_steps = 0
-            #     total_val_loss = 0.0
-            #     with torch.no_grad():
-            #         for x, y in val_loader:
-            #             x = x.to(device, non_blocking=True)#(256, 1, 1, 256)
-            #             y = y.to(device, non_blocking=True)#(256, 1)
+            #Evaluation    
+            if train_steps % args.val_every == 0 and train_steps > 0:
+                logger.info(f"Begining evaluation at step{train_steps}, epoch{epoch}")
+                gpt_reg_model.eval()
+                val_steps = 0
+                total_val_loss = 0.0
+                total_val_code_loss = 0.0
+                total_val_img_loss = 0.0
+                total_val_ploss = 0.0
+                with torch.no_grad():
+                    for x, y in val_loader:
+                        x = x.to(device, non_blocking=True)#(256, 1, 1, 256)
+                        y = y.to(device, non_blocking=True)#(256, 1)
                         
-            #             if args.no_mem==True:
-            #                 print(f"no_mem is True, mem is set to None")
-            #                 mem = None
-            #             else:
-            #                 mem = x.unsqueeze(2).permute(0,3,1,2) # from (B, 256, z_dim=16) to (B, z_dim=16, 256, 1)
-            #                 mem = model.module.fvae.get_quant_from_vae_latent(mem)  # (B, z_dim=16, 256, 1) -> (B, z_dim=8, 256, 1)
-            #                 mem = mem.permute(0,2,3,1) # (B, 256, 1, z_dim=8)
-            #                 mem = mem.squeeze(2).detach()  # (B, 256, z_dim=8)
+                        if args.no_mem==True:
+                            print(f"no_mem is True, mem is set to None")
+                            mem = None
+                        else:
+                            mem = x_to_mem(x, gpt_reg_model)
             
-            #             with torch.cuda.amp.autocast(dtype=ptdtype):  
-            #                 _, mse_loss, ploss, _, _ = model(codes=x, cond_idx=y, mem=mem, input_pos=torch.arange(256), targets=x)
-            #             loss = mse_loss + ploss
-            #             total_val_loss += loss.item()
-            #             val_steps += 1
-            #         print(f"total_val_loss = {total_val_loss}, val_steps = {val_steps}")
-            #     avg_val_loss = torch.tensor(total_val_loss / val_steps, device=device)
+                        with torch.cuda.amp.autocast(dtype=ptdtype):  
+                            _, code_loss, img_loss, ploss, _, _ = gpt_reg_model(codes=x, cond_idx=y, mem=mem, input_pos=torch.arange(256), targets=x)
+                        loss = code_loss + img_loss + ploss
+                        total_val_loss += loss.item()
+                        total_val_code_loss += code_loss.item()
+                        total_val_img_loss += img_loss.item()
+                        total_val_ploss += ploss.item()
+                        val_steps += 1
+                    print(f"total_val_loss = {total_val_loss}, val_steps = {val_steps}")
+                avg_val_loss = torch.tensor(total_val_loss / val_steps, device=device)
+                avg_val_code_loss = torch.tensor(total_val_code_loss / val_steps, device=device)
+                avg_val_img_loss = torch.tensor(total_val_img_loss / val_steps, device=device)
+                avg_val_ploss = torch.tensor(total_val_ploss / val_steps, device=device)
                 
-            #     if rank == 0:
-            #         wandb_logger.log({"step_val_loss": avg_val_loss.item()}, step=train_steps)
+                if rank == 0:
+                    wandb_logger.log({"val_loss": avg_val_loss.item()}, step=train_steps)
+                    wandb_logger.log({"val_code_loss": avg_val_code_loss.item()}, step=train_steps)
+                    wandb_logger.log({"val_img_loss": avg_val_img_loss.item()}, step=train_steps)
+                    wandb_logger.log({"val_ploss": avg_val_ploss.item()}, step=train_steps)
                     
-            #     dist.all_reduce(avg_val_loss, op=dist.ReduceOp.SUM)
-            #     avg_val_loss = avg_val_loss.item() / dist.get_world_size()
-            #     logger.info(f"(step={train_steps:07d}) Val Loss: {avg_val_loss:.4f}")
-            #     if rank == 0:
-            #         wandb_logger.log({"total_val_loss": total_val_loss}, step=train_steps)
-            #         wandb_logger.log({"val_loss": avg_val_loss}, step=train_steps)
-            #     model.train()
+                dist.all_reduce(avg_val_loss, op=dist.ReduceOp.SUM)
+                avg_val_loss = avg_val_loss.item() / dist.get_world_size()
+                logger.info(f"(step={train_steps:07d}) Val Loss: {avg_val_loss:.4f}")
+                if rank == 0:
+                    wandb_logger.log({"total_val_loss": total_val_loss}, step=train_steps)
+                    wandb_logger.log({"avg_val_loss": avg_val_loss}, step=train_steps)
+                gpt_reg_model.train()
                 
             # Visualize fitting result and generation result
             '''
@@ -378,41 +473,45 @@ def main(args):
                         if args.no_mem==True:
                             mem_gt = None
                         else:
-                            mem_gt = x.unsqueeze(2).permute(0,3,1,2) # from (B, 256, z_dim=16) to (B, z_dim=16, 256, 1)
-                            mem_gt = gpt_reg_model.module.fvae.get_quant_from_vae_latent(mem_gt)  # (B, z_dim=16, 256, 1) -> (B, z_dim=8, 256, 1)
-                            mem_gt = mem_gt.permute(0,2,3,1) # (B, 256, 1, z_dim=8)
-                            mem_gt = mem_gt.squeeze(2).detach()  # (B, 256, z_dim=8)
-            
-                        # z_indices = x.reshape(x.shape[0], -1)# (b, 256)
-                        # c_indices = y.reshape(-1)# ([256])
-                        # assert z_indices.shape[0] == c_indices.shape[0]
+                            mem_gt = x_to_mem(x, gpt_reg_model) # (b, 256, z_dim=16) -> (b, 256, zq_dim=8)
+                        
+                        # mem_gt_reshape = mem_gt.reshape(args.vis_num, latent_size, latent_size, -1).permute(0, 3, 1, 2) # (b, 256, z_dim=8) -> (b, z_dim=8, 16, 16)
+                        # mem_gt_dec = gpt_reg_model.module.fvae.vq.decode(mem_gt_reshape)
+                        mem_gt_dec = mem_to_img(mem_gt, gpt_reg_model)
+                        mem_gt_grid = make_grid(mem_gt_dec, nrow=args.vis_num, normalize=True, value_range=(-1, 1))
+
+                        z_indices = x.reshape(x.shape[0], -1)# (b, 256)
+                        c_indices = y.reshape(-1)# ([256])
+                        assert z_indices.shape[0] == c_indices.shape[0]
                         with torch.cuda.amp.autocast(dtype=ptdtype):  
-                            _, mse_loss, ploss, gt_img, recon_img = gpt_reg_model(codes=x, cond_idx=y, mem=mem_gt, input_pos=torch.arange(256), targets=x)
+                            _, _, _, _, gt_img, recon_img = gpt_reg_model(codes=x, cond_idx=y, mem=mem_gt, input_pos=torch.arange(256), targets=x)
                             
                         recon_grid = make_grid(recon_img, nrow=args.vis_num, normalize=True, value_range=(-1, 1))
                         gt_grid = make_grid(gt_img, nrow=args.vis_num, normalize=True, value_range=(-1, 1))
-                        combined_grid = torch.cat((gt_grid, recon_grid), dim=1)
+                        combined_grid = torch.cat((gt_grid, mem_gt_grid, recon_grid), dim=1)
                         combined_image = combined_grid.permute(1, 2, 0).cpu().to(torch.float32).numpy()
                         combined_image = (combined_image * 255).astype(np.uint8)
+                        
                         if rank == 0:
                             wandb_logger.log({"Reconstruction Comparison": wandb.Image(combined_image)}, step=train_steps)
-                        save_image(combined_grid, "/home/renderex/causal_groups/jinyuan.hu/factorizedVAE/factorized_VAE/images/GPT-Reg-fit-res.png")
+                            save_image(combined_grid, "/home/renderex/causal_groups/jinyuan.hu/factorizedVAE/factorized_VAE/images/GPT-Reg-fit-res.png")
                         
                         # ++++++++++++++++++ Visualize generation results +++++++++++++++++++++ #
                         # ------------------ Generate with ground truth memory ------------------- #
                         c_indices_gen = torch.randint(0, 10, (args.vis_num,), device=device)#换成imagenet时注意把这里的10改成1000（num_classes）
                         
+                        #print("c_indices_gen.shape:", c_indices_gen.shape)
                         code_sample = generate_continous_code(
                             model=gpt_reg_model.module, cond=c_indices_gen, mem=mem_gt, max_new_codes=latent_size ** 2,
                             cfg_scale=args.cfg_scale, cfg_interval=args.cfg_interval)
                         
                         b, l, c = code_sample.shape
                         h = w = int(np.sqrt(l))
-                                                
+                                              
                         code_sample = code_sample.reshape(b, h, w, c).permute(0, 3, 1, 2)  # (b, 16, 16, 16)
                         img_sample = gpt_reg_model.module.fvae.kl.decode(code_sample)  # (b, 3, 256, 256)
                         gen_grid1 = make_grid(img_sample, nrow=args.vis_num, normalize=True, value_range=(-1, 1))
-                        mem_gt_grid = gt_grid
+                        
                         # combined_grid2 = torch.cat((mem_gt_grid, gen_grid1), dim=1)
                         # combined_image2 = combined_grid2.permute(1, 2, 0).cpu().numpy()
                         # combined_image2 = (combined_image2 * 255).astype(np.uint8)
@@ -441,10 +540,12 @@ def main(args):
                         #     else:
                         #         break
                         #print("index_sample.shape:", index_sample.shape)
-                        vq_code = gpt_reg_model.module.fvae.vq.quantize.get_codebook_entry(index_sample, shape=(b, 16, 16, 8)) # (b, 8, 16, 16)
-                        vq_code_dec = gpt_reg_model.module.fvae.vq.decode(vq_code)
-                        mem_gen_grid = make_grid(vq_code_dec, nrow=args.vis_num, normalize=True, value_range=(-1, 1))
-                        mem_gen = vq_code.permute(0, 2, 3, 1).reshape(b, latent_size ** 2, -1)  # (b, 256, 8)
+                        quant_code = gpt_reg_model.module.fvae.vq.quantize.get_codebook_entry(index_sample, shape=(b, 16, 16, 8)) # (b, 8, 16, 16)
+                        # quant_code_dec = gpt_reg_model.module.fvae.vq.decode(quant_code)
+                        # mem_gen_grid = make_grid(quant_code_dec, nrow=args.vis_num, normalize=True, value_range=(-1, 1))
+                        mem_gen = quant_code.permute(0, 2, 3, 1).reshape(b, latent_size ** 2, -1)  # (b, 256, 8)
+                        mem_gen_dec = mem_to_img(mem_gen, gpt_reg_model)  # (b, 3, 256, 256)
+                        mem_gen_grid = make_grid(mem_gen_dec, nrow=args.vis_num, normalize=True, value_range=(-1, 1))
                         
                         code_sample2 = generate_continous_code(
                             model=gpt_reg_model.module, cond=c_indices_gen, mem=mem_gen, max_new_codes=latent_size ** 2,
@@ -456,30 +557,14 @@ def main(args):
                         code_sample2 = code_sample2.reshape(b, h, w, c).permute(0, 3, 1, 2)  # (b, 16, 16, 16)
                         img_sample2 = gpt_reg_model.module.fvae.kl.decode(code_sample2)  # (b, 3, 256, 256)
                         gen_grid2 = make_grid(img_sample2, nrow=args.vis_num, normalize=True, value_range=(-1, 1))
-                        
-                        mem_mean = (mem_gen + mem_gt) / 2 # (B, 256, 8)
-                        mean_mean_code = mem_mean.reshape(b, h, w, -1).permute(0, 3, 1, 2)  # (b, 8, 16, 16)
-                        mem_mean_dec = gpt_reg_model.module.fvae.vq.decode(mean_mean_code)
-                        mem_mean_grid = make_grid(mem_mean_dec, nrow=args.vis_num, normalize=True, value_range=(-1, 1))
-                        
-                        
-                        code_sample3 = generate_continous_code(
-                            model=gpt_reg_model.module, cond=c_indices_gen, mem=mem_mean, max_new_codes=latent_size ** 2,
-                            cfg_scale=args.cfg_scale, cfg_interval=args.cfg_interval)
-                        b, l, c = code_sample3.shape
-                        h = w = int(np.sqrt(l))
-                        code_sample3 = code_sample3.reshape(b, h, w, c).permute(0, 3, 1, 2)  # (b, 16, 16, 16)
-                        img_sample3 = gpt_reg_model.module.fvae.kl.decode(code_sample3)  # (b, 3, 256, 256)
-                        gen_grid3 = make_grid(img_sample3, nrow=args.vis_num, normalize=True, value_range=(-1, 1))
-                        
-                        combined_grid3 = torch.cat((mem_gt_grid, gen_grid1, mem_gen_grid, gen_grid2, mem_mean_grid, gen_grid3), dim=1)
+                                                
+                        combined_grid3 = torch.cat((mem_gt_grid, gen_grid1, mem_gen_grid, gen_grid2), dim=1)
                         combined_image3 = combined_grid3.permute(1, 2, 0).cpu().numpy()
                         combined_image3 = (combined_image3 * 255).astype(np.uint8)
-                        print("l2 gap_between mem_gt and mem_gen:", torch.nn.functional.mse_loss(mem_gt, mem_gen).item())
-                        
+                        #print("l2 gap_between mem_gt and mem_gen:", torch.nn.functional.mse_loss(mem_gt, mem_gen).item())
                         if rank == 0:
                             wandb_logger.log({"Generation with Sampled Memory": wandb.Image(combined_image3)}, step=train_steps)
-                        save_image(combined_grid3, "/home/renderex/causal_groups/jinyuan.hu/factorizedVAE/factorized_VAE/images/GPT-Reg-gen-res.png")
+                            save_image(combined_grid3, "/home/renderex/causal_groups/jinyuan.hu/factorizedVAE/factorized_VAE/images/GPT-Reg-gen-res.png")
                         
                         # -------------------------------------------------------------------------- #
                         # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ #
@@ -563,8 +648,10 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt-every", type=int, default=5000)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--mixed-precision", type=str, default='bf16', choices=["none", "fp16", "bf16"])
+
     parser.add_argument("--no-mem", action='store_true', default='False', help="whether to use memory projection in the model")
-    
+    parser.add_argument("--min-ratio", type=float, default=0.3)
+
     parser.add_argument("--cfg-scale",  type=float, default=1.5)
     parser.add_argument("--cfg-interval", type=float, default=-1)
     parser.add_argument("--top-k", type=int, default=0,help="top-k value to sample with")

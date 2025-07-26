@@ -1,6 +1,6 @@
 import os
 from torchvision.datasets import ImageFolder
-from LlamaGen.dataset.custom_dataset import CustomDataset
+from LlamaGen_mod.dataset.custom_dataset import CustomDataset
 
 def build_cifar10(args, transform):
     return ImageFolder(args.data_path, transform=transform)

@@ -1,9 +1,9 @@
-from LlamaGen.dataset.imagenet import build_imagenet, build_imagenet_code
-from LlamaGen.dataset.cifar10 import build_cifar10, build_cifar10_code
-from LlamaGen.dataset.coco import build_coco
-from LlamaGen.dataset.openimage import build_openimage
-from LlamaGen.dataset.pexels import build_pexels
-from LlamaGen.dataset.t2i import build_t2i, build_t2i_code, build_t2i_image
+from LlamaGen_mod.dataset.imagenet import build_imagenet, build_imagenet_code
+from LlamaGen_mod.dataset.cifar10 import build_cifar10, build_cifar10_code
+from LlamaGen_mod.dataset.coco import build_coco
+from LlamaGen_mod.dataset.openimage import build_openimage
+from LlamaGen_mod.dataset.pexels import build_pexels
+from LlamaGen_mod.dataset.t2i import build_t2i, build_t2i_code, build_t2i_image
 
 
 def build_dataset(type, args, **kwargs):

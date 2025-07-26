@@ -117,7 +117,7 @@ class FVAE(nn.Module):
         '''
         get quantized indices from input image x
         x.shape = (batch_size, 3, 256, 256)
-        indices.shape = (batch_size, 16, 16)
+        indices.shape = (batch_size*16*16)
         '''
         z = self.get_vae_latent_from_images(x)
         z = self.ada_block(z)
@@ -142,9 +142,13 @@ class FVAE(nn.Module):
         z.shape = (batch_size, 16, 16, 16)
         quant.shape = (batch_size, 8, 16, 16)
         '''
+        #print("z.shape:", z.shape)
         z = self.ada_block(z)
+        #print("z.shape:", z.shape)
         h = self.vq.quant_conv(z)
+        #print("h shape:", h.shape)
         quant, _, _ = self.vq.quantize(h)
+        #print("quant shape:", quant.shape)
         return quant
     
     def recon_from_indices(self, indices):

@@ -2,8 +2,6 @@
 #   DiT:  https://github.com/facebookresearch/DiT/blob/main/sample_ddp.py
 import torch
 
-from LlamaGen.autoregressive.models import gpt_reg
-from LlamaGen.autoregressive.models import gpt
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 import torch.nn.functional as F
@@ -17,10 +15,12 @@ import numpy as np
 import math
 import argparse
 
-from LlamaGen.tokenizer.tokenizer_image.vq_model import VQ_models
-from LlamaGen.autoregressive.models.gpt import GPT_models
-from LlamaGen.autoregressive.models.gpt_reg import GPT_Reg_models
-from LlamaGen.autoregressive.models.generate import generate, generate_continous_code
+from LlamaGen_mod.autoregressive.models import gpt_reg
+from LlamaGen_mod.autoregressive.models import gpt
+from LlamaGen_mod.tokenizer.tokenizer_image.vq_model import VQ_models
+from LlamaGen_mod.autoregressive.models.gpt import GPT_models
+from LlamaGen_mod.autoregressive.models.gpt_reg import GPT_Reg_models
+from LlamaGen_mod.autoregressive.models.generate import generate, generate_continous_code
 
 from factorized_VAE.my_models.fvae import FVAE
 
@@ -185,9 +185,10 @@ def main(args):
         #     else:
         #         break
         #print("index_sample.shape:", index_sample.shape)
-        vq_code = fvae.vq.quantize.get_codebook_entry(index_sample, shape=(n, 16, 16, 8)) # (b, 8, 16, 16)
-        b, c, h, w = vq_code.shape
-        vq_code_dec = fvae.vq.decode(vq_code) # (b, 3, 256, 256)
+        # vq_code = fvae.vq.quantize.get_codebook_entry(index_sample, shape=(n, 16, 16, 8)) # (b, 8, 16, 16)
+        # b, c, h, w = vq_code.shape
+        # vq_code_dec = fvae.vq.decode(vq_code) # (b, 3, 256, 256)
+        quant_code = gpt_reg_model.fvae.vq.quantize.get_codebook_entry(index_sample, shape=(n, 16, 16, 8)) # (b, 8, 16, 16)
         
         print("args.no_mem:", args.no_mem) 
         if args.no_mem==True:
@@ -195,8 +196,10 @@ def main(args):
             print("no memory projection, mem is None")
         else:
             print("using memory projection")
-            mem = vq_code.permute(0, 2, 3, 1).reshape(b, h * w, c)  # (b, 256, 8)
+            mem = quant_code.permute(0, 2, 3, 1).reshape(n, latent_size ** 2, -1)
+            #mem = vq_code.permute(0, 2, 3, 1).reshape(b, h * w, c)  # (b, 256, 8)
         #print("mem.shape:", mem.shape)
+        
         
         
         code_sample = generate_continous_code(
@@ -204,15 +207,18 @@ def main(args):
             cfg_scale=args.cfg_scale, cfg_interval=args.cfg_interval)
         # code_sample.shape = (batch_size, 256, 16)
         
-        code_sample = code_sample.reshape(b, h, w, -1).permute(0, 3, 1, 2)  # (b, 16, 16, 16)
+        code_sample = code_sample.reshape(n, latent_size, latent_size, -1).permute(0, 3, 1, 2)  # (b, 16, 16, 16)
         img_sample = fvae.kl.decode(code_sample)  # (b, 3, 256, 256)
         
+        mem_code = mem.reshape(n, 16, 16, -1).permute(0, 3, 1, 2)  
+        mem_code_dec = fvae.vq.decode(mem_code.to(torch.float32))  # (b, 3, 256, 256)
         
+                
         for i in range(n):
             index = i * dist.get_world_size() + rank + total
             if index < args.num_fid_samples:
                 save_image(img_sample[i], f"{sample_folder_dir}/{index:06d}.png", normalize=True, value_range=(-1, 1))
-                save_image(vq_code_dec[i], f"{sample_folder_dir}/{index:06d}_mem.png", normalize=True, value_range=(-1, 1))
+                save_image(mem_code_dec[i], f"{sample_folder_dir}/{index:06d}_mem.png", normalize=True, value_range=(-1, 1))
             else:
                 break
             

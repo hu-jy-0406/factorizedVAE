@@ -21,12 +21,12 @@ import wandb
 from datetime import datetime
 import numpy as np
 
-from LlamaGen.utils.logger import create_logger
-from LlamaGen.utils.distributed import init_distributed_mode
-from LlamaGen.utils.ema import update_ema, requires_grad
-from LlamaGen.dataset.build import build_dataset
-from LlamaGen.autoregressive.models.gpt import GPT_models
-from LlamaGen.autoregressive.models.generate import generate
+from LlamaGen_mod.utils.logger import create_logger
+from LlamaGen_mod.utils.distributed import init_distributed_mode
+from LlamaGen_mod.utils.ema import update_ema, requires_grad
+from LlamaGen_mod.dataset.build import build_dataset
+from LlamaGen_mod.autoregressive.models.gpt import GPT_models
+from LlamaGen_mod.autoregressive.models.generate import generate
 
 from factorized_VAE.my_models.fvae import FVAE
 
@@ -237,7 +237,7 @@ def main(args):
     for epoch in range(start_epoch, args.epochs):
         train_sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
-        for x, y in vis_loader:
+        for x, y in train_loader:
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
             z_indices = x.reshape(x.shape[0], -1)
@@ -283,7 +283,7 @@ def main(args):
             # Evaluation    
             if train_steps % args.val_every == 0 and train_steps > 0:
                 logger.info(f"Begining evaluation at step{train_steps}, epoch{epoch}")
-                model.eval()#这里不能加model.eval()，加之后model.forward()会报错
+                model.eval()
                 val_steps = 0
                 total_val_loss = 0.0
                 with torch.no_grad():
@@ -308,9 +308,6 @@ def main(args):
                 model.train()
                 
             # Visualize fitting result and generation result
-            '''
-            判断模型对训练样本的拟合情况以及生成新样本的能力
-            '''
             if train_steps % args.vis_every == 0 and train_steps > 0:
                 logger.info(f"Begining visualization at step{train_steps}, epoch{epoch}")
                 model.eval()
