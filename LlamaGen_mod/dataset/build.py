@@ -8,6 +8,7 @@ from LlamaGen_mod.dataset.t2i import build_t2i, build_t2i_code, build_t2i_image
 
 def build_dataset(type, args, **kwargs):
     # images
+    print(args.dataset)
     print(f'Building dataset {args.dataset} ...')
     if args.dataset == 'imagenet':
         return build_imagenet(args, **kwargs)

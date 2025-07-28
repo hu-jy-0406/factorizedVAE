@@ -1,12 +1,12 @@
 # !/bin/bash
 set -x
 
-export CUDA_VISIBLE_DEVICES=1,2,3,4,5,6
-export PYTHONPATH=/home/renderex/causal_groups/jinyuan.hu/factorizedVAE:$PYTHONPATH
+export CUDA_VISIBLE_DEVICES=2
+export PYTHONPATH=/home/guangyi.chen/causal_group/jinyuan.hu/factorizedVAE:$PYTHONPATH
 export PYTORCH_SYMBOLIC_SHAPES_DISABLE_WARNINGS=1
 export TORCH_DISTRIBUTED_DEBUG=INFO
 
-#export WANDB_MODE=disabled
+export WANDB_MODE=disabled
 
 # torchrun \
 # --nnodes=$nnodes --nproc_per_node=$nproc_per_node --node_rank=$node_rank \
@@ -14,26 +14,26 @@ export TORCH_DISTRIBUTED_DEBUG=INFO
 # autoregressive/train/train_c2i.py "$@"
 
 torchrun \
---nnodes=1 --nproc_per_node=6 --node_rank=0 \
+--nnodes=1 --nproc_per_node=1 --node_rank=0 \
 --master_port=12359 \
 autoregressive/train/train_c2i_reg.py \
 --dataset cifar10_code \
---train-code-path /mnt/disk3/jinyuan/CIFAR10-latent/fvae/train \
---val-code-path /mnt/disk3/jinyuan/CIFAR10-latent/fvae/val \
+--train-code-path /home/guangyi.chen/causal_group/jinyuan.hu/CIFAR10-latent/fvae/train/ \
+--val-code-path /home/guangyi.chen/causal_group/jinyuan.hu/CIFAR10-latent/fvae/val/ \
 --image-size 256 \
 --num-classes 10 \
 --cfg-scale 2.0 \
---global-batch-size 192 \
---vis-num 8 \
---epochs 5 \
---log-every 50 \
---vis-every 100 \
---val-every 100 \
+--global-batch-size 2 \
+--vis-num 2 \
+--epochs 1 \
+--log-every 1 \
+--vis-every 1 \
+--val-every 1 \
 --ckpt-every 100000 \
 --no-local-save \
---cloud-save-path /mnt/disk3/jinyuan/ckpts/lamma_gen/ar_reg/cifar10 \
+--cloud-save-path /home/guangyi.chen/causal_group/jinyuan.hu/ckpts/LlamaGen/ar_reg/cifar10 \
 --min-ratio 0.3 \
---gpt-ckpt /mnt/disk3/jinyuan/ckpts/lamma_gen/ar/pretrain_cifar10/2025-07-15-14-52-51/060-GPT-B/checkpoints/0002600.pt \
+--gpt-ckpt /home/guangyi.chen/causal_group/jinyuan.hu/ckpts/LlamaGen/ar/cifar10/0002600.pt \
 # --gpt-reg-ckpt /mnt/disk3/jinyuan/ckpts/lamma_gen/test/2025-07-23-17-44-35/046-GPT-Reg-B/checkpoints/0005000.pt
 
 # --gpt-ckpt /mnt/disk3/jinyuan/ckpts/lamma_gen/test/2025-07-23-14-12-26/035-GPT-Reg-B/checkpoints/0001000.pt

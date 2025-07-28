@@ -40,7 +40,7 @@ class TransformerReg(Transformer):
         super().__init__(config)
         
         self.fvae = FVAE()
-        ckpt_path = "/mnt/disk3/jinyuan/ckpts/fvae/full/fvae_full_3loss+epoch10.pth"
+        ckpt_path = "/home/guangyi.chen/causal_group/jinyuan.hu/ckpts/fvae/fvae_full_3loss+epoch10.pth"
         ckpt = torch.load(ckpt_path)
         self.fvae.load_state_dict(ckpt["model"])    
         for param in self.fvae.parameters():
@@ -81,7 +81,7 @@ class TransformerReg(Transformer):
         mask: Optional[torch.Tensor] = None
     ):
         
-        mem = mem.detach()
+        #mem = mem.detach()
 
         if codes is not None and cond_idx is not None:
             # codes.shape=(bs, 256, 16)
@@ -89,6 +89,7 @@ class TransformerReg(Transformer):
             
             codes_embeddings = self.input_proj(codes[:, :-1, :]) # (bs, 255, 768)
             
+            #print(f"codes_embeddings.shape: {codes_embeddings.shape}, cond_embeddings.shape: {cond_embeddings.shape}")
             codes_embeddings = torch.cat((cond_embeddings, codes_embeddings), dim=1) # (64, 256, 768)
             
             h = self.tok_dropout(codes_embeddings)
@@ -108,6 +109,7 @@ class TransformerReg(Transformer):
         
         # self.freqs_cis.shape: (257, 32, 2)
         if self.training:
+            #print("training mode")
             freqs_cis = self.freqs_cis[:codes.shape[1]] # (256, 32, 2)
         else:
             '''
@@ -123,7 +125,9 @@ class TransformerReg(Transformer):
                 freqs_cis.shape = (1, 32, 2)
                 
             '''
+            #print("input_pos:", input_pos)
             freqs_cis = self.freqs_cis[input_pos]
+            #print("freqs_cis.shape:", freqs_cis.shape)
  
         mem_proj = self.input_proj2(mem.to(dtype=self.input_proj2.weight.dtype)) if mem is not None else None  # (B, 256, z_dim=768)
 
@@ -154,6 +158,12 @@ class TransformerReg(Transformer):
                 
             '''
             #zero_mem = torch.zeros_like(mem_proj)  # (B, 256, z_dim=768)
+
+            # print("h.shape:", h.shape)
+            # print("mem_proj.shape:", mem_proj.shape if mem_proj is not None else None)
+            # print("freqs_cis.shape:", freqs_cis.shape)
+            # print("input_pos:", input_pos)
+            # print("mask.shape:", mask.shape if mask is not None else None)
              
             h = layer(x=h, mem=mem_proj, freqs_cis=freqs_cis, start_pos=input_pos, mask=mask)
             # h = layer(h, freqs_cis=freqs_cis, start_pos=input_pos, mask=mask)

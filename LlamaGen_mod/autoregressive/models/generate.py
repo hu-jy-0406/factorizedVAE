@@ -2,6 +2,8 @@
 #   gpt-fast: https://github.com/pytorch-labs/gpt-fast/blob/main/generate.py
 #   DiT:      https://github.com/facebookresearch/DiT/blob/main/models.py
 from builtins import print
+from pyexpat.errors import codes
+from tkinter import N
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -93,6 +95,8 @@ def prefill_continous_code(model, cond_idx: torch.Tensor, mem: torch.Tensor, inp
         # mem.shape = (32, 1, 16, 16)
         # input_pos.shape = (1)
         #print("cond_idx.shape:", cond_idx.shape, "mem.shape:", mem.shape)
+        # print("cond_idx:", cond_idx)
+        # print("cond_idx.shape:", cond_idx.shape)
         logits = model(codes=None, cond_idx=cond_idx, mem=mem, input_pos=input_pos)
         logits_combined = logits
         cond_logits, uncond_logits = torch.split(logits_combined, len(logits_combined) // 2, dim=0)
@@ -196,6 +200,8 @@ def decode_n_codes(
     new_codes = []
     cfg_flag = True
     print("num_new_codes:", num_new_codes)
+    print("mem.shape:", mem.shape if mem is not None else None)
+    print("input_pos:", input_pos)
     for i in range(num_new_codes):
         with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True):
             if cfg_interval > -1 and i > cfg_interval:
@@ -212,6 +218,53 @@ def decode_n_codes(
             new_codes.append(next_code.clone())
             cur_code = next_code # todo: change shape
     return new_codes
+
+def decode_n_codes_debug(
+    model, cur_code, gt_codes: torch.Tensor, mem: torch.Tensor, input_pos: torch.Tensor, num_new_codes: int,
+    cfg_scale: float, cfg_interval: int):
+    codes_gt_context = []
+    codes_gen_context = []
+    cfg_flag = True
+    for i in range(num_new_codes):
+        with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True):
+            if cfg_interval > -1 and i > cfg_interval:
+                cfg_flag = False
+
+            next_code_gt_context = decode_one_code(
+                model, gt_codes[:, i:i+1, :], mem[:, i:i+1, :] if mem is not None else None,
+                input_pos, cfg_scale, cfg_flag
+            )
+            codes_gt_context.append(next_code_gt_context.clone())
+
+            next_code_gen_context = decode_one_code(
+                model, cur_code, mem[:, i:i+1, :] if mem is not None else None,
+                input_pos, cfg_scale, cfg_flag
+            )
+            codes_gen_context.append(next_code_gen_context.clone())
+            cur_code = next_code_gen_context
+
+            input_pos = input_pos + 1            
+
+    #codes_gen_context = torch.zeros_like(codes_gt_context)
+    return codes_gt_context, codes_gen_context
+
+# def decode_n_codes_debug(
+#     model, cur_code: torch.Tensor, mem: torch.Tensor, input_pos: torch.Tensor, num_new_codes: int,
+#     cfg_scale: float, cfg_interval: int):
+#     new_codes = []
+#     cfg_flag = True
+#     for i in range(num_new_codes):
+#         with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True):
+#             if cfg_interval > -1 and i > cfg_interval:
+#                 cfg_flag = False
+#             next_code = decode_one_code(
+#                 model, cur_code, mem[:, i:i+1, :] if mem is not None else None,
+#                 input_pos, cfg_scale, cfg_flag
+#             )
+#             input_pos = input_pos + 1
+#             new_codes.append(next_code.clone())
+#             cur_code = next_code # todo: change shape
+#     return new_codes
 
 @torch.no_grad()
 def generate(model, cond, max_new_tokens, emb_masks=None, 
@@ -340,6 +393,78 @@ def generate_with_given_tokens(model, cond, given_tokens, max_new_tokens,
 
     return seq[:, T:]
 
+def generate_debug(model, cond, gt_codes, mem, max_new_codes, emb_masks=None,
+                   cfg_scale=1.0, cfg_interval=-1):
+    if model.model_type == 'c2i':
+        if cfg_scale > 1.0:
+            cond_null = torch.ones_like(cond) * model.num_classes
+            cond_combined = torch.cat([cond, cond_null])
+            mem_combined = torch.cat([mem, mem]) if mem is not None else None
+        else:
+            cond_combined = cond
+            mem_combined = mem
+        T = 1
+    elif model.model_type == 't2i':
+        if cfg_scale > 1.0:
+            cond_null = torch.zeros_like(cond) + model.cls_embedding.uncond_embedding
+            cond_combined = torch.cat([cond, cond_null])
+            mem_combined = torch.cat([mem, mem]) if mem is not None else None
+        else:
+            cond_combined = cond
+            mem_combined = mem
+        T = cond.shape[1]      
+    else:
+        raise Exception("please check model type")
+    
+    T_new = T + max_new_codes
+    max_seq_length = T_new
+    max_batch_size = cond.shape[0]
+    
+    device = cond.device
+    with torch.device(device):
+        max_batch_size_cfg = max_batch_size * 2 if cfg_scale > 1.0 else max_batch_size
+        model.setup_caches(max_batch_size=max_batch_size_cfg, max_seq_length=max_seq_length, dtype=model.input_proj.weight.dtype)
+
+    if emb_masks is not None:
+        assert emb_masks.shape[0] == max_batch_size
+        assert emb_masks.shape[-1] == T
+        if cfg_scale > 1.0:
+            model.causal_mask[:, :, :T] = model.causal_mask[:, :, :T] * torch.cat([emb_masks, emb_masks]).unsqueeze(1)
+        else:
+            model.causal_mask[:, :, :T] = model.causal_mask[:, :, :T] * emb_masks.unsqueeze(1)
+
+        eye_matrix = torch.eye(model.causal_mask.size(1), model.causal_mask.size(2), device=device)
+        model.causal_mask[:] = model.causal_mask * (1 - eye_matrix) + eye_matrix
+        
+    seq_gt_context = torch.empty((max_batch_size, T_new, model.fvae.kl.embed_dim), dtype=torch.float32, device=device)
+    seq_gen_context = torch.empty((max_batch_size, T_new, model.fvae.kl.embed_dim), dtype=torch.float32, device=device)
+
+    input_pos = torch.arange(0, T, device=device)
+    
+    # cfg_scale == 1
+    # cond_combined.shape = (b)
+    # mem_combined.shape = (b, 256, 8)
+    next_code = prefill_continous_code(model=model, cond_idx=cond_combined.long(), 
+                                       mem=mem_combined[:, :1, :] if mem_combined is not None else None,
+                                       input_pos=input_pos, cfg_scale=cfg_scale)
+    seq_gt_context[:, T:T+1, :] = gt_codes[:, :1, :]
+    seq_gen_context[:, T:T+1, :] = next_code
+
+    input_pos = torch.tensor([T], device=device, dtype=torch.int)
+
+    codes_gt_context, code_gen_context = decode_n_codes_debug(
+        model, next_code, gt_codes, mem[:, 1:, :] if mem is not None else None,
+        input_pos, max_new_codes-1, cfg_scale, cfg_interval
+    )
+
+    seq_gt_context[:, T+1:, :] = torch.cat(codes_gt_context, dim=1)
+    seq_gen_context[:, T+1:, :] = torch.cat(code_gen_context, dim=1)
+    #seq_gt_context[:, T+1:, :] = torch.zeros_like(seq_gen_context[:, T+1:, :]) # todo: change to zeros, for debug
+
+
+    model.del_caches()
+    
+    return seq_gt_context[:, T:], seq_gen_context[:, T:]
 
 def generate_continous_code(model, cond, mem, max_new_codes, emb_masks=None, cfg_scale=1.0, cfg_interval=-1):
     if model.model_type == 'c2i':
@@ -385,17 +510,32 @@ def generate_continous_code(model, cond, mem, max_new_codes, emb_masks=None, cfg
         
     seq = torch.empty((max_batch_size, T_new, model.fvae.kl.embed_dim), dtype=torch.float32, device=device)
     
+    # print("\n")
+    # print("max_batch_size:", max_batch_size)
+    # print("seq.shape:", seq.shape)
+    
     input_pos = torch.arange(0, T, device=device)
     
-    #print("cond_combined.shape:", cond_combined.shape)
+    # cfg_scale == 1
+    # cond_combined.shape = (b)
+    # mem_combined.shape = (b, 256, 8)
     next_code = prefill_continous_code(model=model, cond_idx=cond_combined, 
                                        mem=mem_combined[:, :1, :] if mem_combined is not None else None,
                                        input_pos=input_pos, cfg_scale=cfg_scale)
+    # next_code.shape = (b, 1, 16)
     seq[:, T:T+1, :] = next_code
+
+    # print("cfg_scale:", cfg_scale)
+    # print("next_code.shape:", next_code.shape)
+    # print("seq.shape:", seq.shape)
+    # print("\n")
+    
     
     input_pos = torch.tensor([T], device=device, dtype=torch.int)
-    # # print("type(input_pos):", type(input_pos), "input_pos:", input_pos)
-    # print("mem[:, 1:, :].shape:", mem[:, 1:, :].shape)
+    print("input_pos:", input_pos)
+    
+    #查看mem是否要[:, 1:, :]
+    #确认decode_n_codes和decode_n_codes_debug的传参
     generated_codes = decode_n_codes(model, next_code, mem[:, 1:, :] if mem is not None else None,
                                      input_pos, max_new_codes-1, cfg_scale, cfg_interval)
     seq[:, T+1:, :] = torch.cat(generated_codes, dim=1)
@@ -406,4 +546,82 @@ def generate_continous_code(model, cond, mem, max_new_codes, emb_masks=None, cfg
     
     return seq[:, T:]
     
+
+
+
+def generate_code_wo_kvcache(model, cond, gt_codes, mem, seq_len=256, emb_masks=None, cfg_scale=1.0, cfg_interval=-1):
+    if model.model_type == 'c2i':
+        if cfg_scale > 1.0:
+            cond_null = torch.ones_like(cond) * model.num_classes
+            cond_combined = torch.cat([cond, cond_null])
+            mem_combined = torch.cat([mem, mem]) if mem is not None else None
+        else:
+            cond_combined = cond
+            mem_combined = mem
+    elif model.model_type == 't2i':
+        raise NotImplementedError("generate_code_wo_kvcache is not implemented for t2i model type") 
+    else:
+        raise Exception("please check model type")
     
+    max_batch_size = cond.shape[0]
+    
+    device = cond.device
+
+    if emb_masks is not None:
+        raise NotImplementedError("emb_masks is not supported in generate_code_wo_kvcache")
+
+    gen_ar = torch.zeros((max_batch_size, seq_len, model.fvae.kl.embed_dim), dtype=torch.float32, device=device)
+    gen_ar = gen_ar.to(dtype=next(model.parameters()).dtype)
+
+    gt_context = torch.zeros_like(gen_ar) #作为context的ground truth codes
+    gt_context = gt_context.to(dtype=next(model.parameters()).dtype)
+    gen_gt = torch.zeros_like(gen_ar) #以ground truth codes作为context的生成codes
+    gen_gt = gen_gt.to(dtype=next(model.parameters()).dtype)
+
+    # print("seq.shape:", seq.shape)
+    # 如果cfg_scale > 1.0, seq.shape == logits.shape == (b*2, 256, 16)
+    # 否则seq.shape == logits.shape == (b, 256, 16)
+    # print("cond_combined.shape:", cond_combined.shape)
+    # print("mem_combined.shape:", mem_combined.shape if mem_combined is not None else None)
+    
+
+    # ------------------ suitable for different cfg_scale ----------------------- #
+    # if cfg_scale > 1.0:
+    #     logits_combined = model(codes=torch.cat([gen_ar, gen_ar]), cond_idx=cond_combined, mem=mem_combined, input_pos=torch.arange(seq_len))
+    #     cond_logits, uncond_logits = torch.split(logits_combined, len(logits_combined) // 2, dim=0)
+    #     gen_ar_logits = uncond_logits + (cond_logits - uncond_logits) * cfg_scale
+    # else:
+    #     gen_ar_logits = model(codes=gen_ar, cond_idx=cond_combined, mem=mem_combined, input_pos=torch.arange(seq_len))
+
+    # assert gen_ar_logits.shape == gen_ar.shape
+
+    # gen_ar[:, :1, :] = gen_ar_logits[:, :1, :]  # Fill the first token with logits
+    # gen_gt[:, :1, :] = gen_ar_logits[:, :1, :]  # Fill the first token with logits
+    
+    # gt_context[:, :1, :] = gt_codes[:, :1, :]  # Fill the first token with gt_codes
+
+    # for i in range(1, seq_len):
+    #     gen_ar_logits = model(codes=gen_ar, cond_idx=cond, mem=mem, input_pos=torch.arange(seq_len))
+    #     gen_ar[:, i:i+1, :] = gen_ar_logits[:, i:i+1, :]
+
+    #     gen_gt_logits = model(codes=gt_context, cond_idx=cond, mem=mem, input_pos=torch.arange(seq_len))
+    #     gt_context[:, i:i+1, :] = gt_codes[:, i:i+1, :]
+    #     gen_gt[:, i:i+1, :] = gen_gt_logits[:, i:i+1, :]
+    # --------------------------------------------------------------------------- #
+
+    # -------------- without consideration about cfg_scale ---------------- #
+    for i in range(seq_len):
+        gen_ar_logits = model(gen_ar, cond_idx=cond, mem=mem, input_pos=torch.arange(seq_len))
+        gen_ar[:, i:i+1, :] = gen_ar_logits[:, i:i+1, :]
+        gen_gt_logits = model(gt_context, cond_idx=cond, mem=mem, input_pos=torch.arange(seq_len))
+        gt_context[:, i:i+1, :] = gt_codes[:, i:i+1, :]
+        gen_gt[:, i:i+1, :] = gen_gt_logits[:, i:i+1, :]
+    # --------------------------------------------------------------------- #
+
+    #seq_gt_context = model(codes=gt_codes, cond_idx=cond, mem=mem, input_pos=torch.arange(seq_len))
+
+    return gen_ar, gen_gt
+
+    
+
+

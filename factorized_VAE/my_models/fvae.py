@@ -34,13 +34,13 @@ class FVAE(nn.Module):
     def __init__(self):
         super().__init__()
         self.kl = self.load_autoencoder(
-            config_path="/mnt/disk3/jinyuan/ckpts/first_stage_models/kl-f16/config.yaml",
-            ckpt_path="/mnt/disk3/jinyuan/ckpts/first_stage_models/kl-f16/model.ckpt",
+            config_path="/home/guangyi.chen/causal_group/jinyuan.hu/ckpts/first_stage_models/kl-f16/config.yaml",
+            ckpt_path="/home/guangyi.chen/causal_group/jinyuan.hu/ckpts/first_stage_models/kl-f16/model.ckpt",
             type="kl"
         ).cuda().eval()
         self.vq = self.load_autoencoder(
-            config_path="/mnt/disk3/jinyuan/ckpts/first_stage_models/vq-f16/config.yaml",
-            ckpt_path="/mnt/disk3/jinyuan/ckpts/first_stage_models/vq-f16/vq-f16.ckpt",
+            config_path="/home/guangyi.chen/causal_group/jinyuan.hu/ckpts/first_stage_models/vq-f16/config.yaml",
+            ckpt_path="/home/guangyi.chen/causal_group/jinyuan.hu/ckpts/first_stage_models/vq-f16/vq-f16.ckpt",
             type="vq"
         ).cuda().eval()
         self.ada_block = AdaBlock(in_channels=16, out_channels=8).cuda()

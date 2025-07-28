@@ -20,7 +20,7 @@ from LlamaGen_mod.autoregressive.models import gpt
 from LlamaGen_mod.tokenizer.tokenizer_image.vq_model import VQ_models
 from LlamaGen_mod.autoregressive.models.gpt import GPT_models
 from LlamaGen_mod.autoregressive.models.gpt_reg import GPT_Reg_models
-from LlamaGen_mod.autoregressive.models.generate import generate, generate_continous_code
+from LlamaGen_mod.autoregressive.models.generate import generate, generate_continous_code, generate_debug
 
 from factorized_VAE.my_models.fvae import FVAE
 
@@ -57,7 +57,7 @@ def main(args):
     print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
     
     fvae = FVAE()
-    ckpt_path = "/mnt/disk3/jinyuan/ckpts/fvae/full/fvae_full_3loss+epoch10.pth"
+    ckpt_path = "/home/guangyi.chen/causal_group/jinyuan.hu/ckpts/fvae/fvae_full_3loss+epoch10.pth"
     ckpt = torch.load(ckpt_path)
     fvae.load_state_dict(ckpt["model"])
 
@@ -71,7 +71,7 @@ def main(args):
         cls_token_num=args.cls_token_num,
         model_type=args.gpt_type,
     ).to(device=device, dtype=precision)
-    gpt_checkpoint = torch.load(args.gpt_ckpt, map_location="cpu")
+    gpt_checkpoint = torch.load(args.gpt_ckpt, map_location="cpu", weights_only=False)
     if args.from_fsdp: # fsdp
         gpt_model_weight = gpt_checkpoint
     elif "model" in gpt_checkpoint:  # ddp
@@ -98,7 +98,7 @@ def main(args):
     print("\n")
     print("args.gpt_reg_ckpt:", args.gpt_reg_ckpt)
     print("\n")
-    gpt_reg_checkpoint = torch.load(args.gpt_reg_ckpt, map_location="cpu")
+    gpt_reg_checkpoint = torch.load(args.gpt_reg_ckpt, map_location="cpu", weights_only=False)
     if args.from_fsdp: # fsdp
         gpt_reg_model_weight = gpt_reg_checkpoint
     elif "model" in gpt_reg_checkpoint:  # ddp
@@ -109,7 +109,8 @@ def main(args):
         gpt_reg_model_weight = gpt_reg_checkpoint["state_dict"]
     else:
         raise Exception("please check model weight, maybe add --from-fsdp to run command")
-    gpt_reg_model.load_state_dict(gpt_reg_model_weight, strict=False)
+    gpt_reg_model.load_state_dict(gpt_reg_model_weight, strict=True)
+    print("gpt_reg_model loaded")
     gpt_reg_model.eval()
     del gpt_reg_checkpoint   
     
@@ -204,8 +205,13 @@ def main(args):
         
         code_sample = generate_continous_code(
             model=gpt_reg_model, cond=c_indices, mem=mem, max_new_codes=latent_size ** 2,
-            cfg_scale=args.cfg_scale, cfg_interval=args.cfg_interval)
-        # code_sample.shape = (batch_size, 256, 16)
+            cfg_scale=args.cfg_scale, cfg_interval=args.cfg_interval
+        )
+
+        # code_sample = generate_debug(
+        #     model=gpt_reg_model, cond=c_indices, gt_codes=gt_codes, mem=mem, max_new_codes=latent_size ** 2,
+        #     cfg_scale=args.cfg_scale, cfg_interval=args.cfg_interval
+        # )
         
         code_sample = code_sample.reshape(n, latent_size, latent_size, -1).permute(0, 3, 1, 2)  # (b, 16, 16, 16)
         img_sample = fvae.kl.decode(code_sample)  # (b, 3, 256, 256)
