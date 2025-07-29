@@ -21,6 +21,7 @@ import wandb
 from datetime import datetime
 import numpy as np
 import math
+import lpips
 
 from LlamaGen_mod.utils.logger import create_logger
 from LlamaGen_mod.utils.distributed import init_distributed_mode
@@ -169,6 +170,9 @@ def main(args):
     # Setup optimizer
     optimizer = creat_optimizer(gpt_reg_model, args.weight_decay, args.lr, (args.beta1, args.beta2), logger)
 
+    # Setup loss
+    ploss_fn = lpips.LPIPS(net='vgg').cuda().eval()
+
     # Setup data:
     # ----------- setup train data -----------
     train_dataset = build_dataset("train", args)
@@ -230,7 +234,7 @@ def main(args):
         cls_token_num=args.cls_token_num,
         model_type=args.gpt_type,
     ).to(device=device, dtype=precision)
-    gpt_checkpoint = torch.load(args.gpt_ckpt, map_location="cpu")
+    gpt_checkpoint = torch.load(args.gpt_ckpt, map_location="cpu", weights_only=False)
     if args.from_fsdp: # fsdp
         gpt_model_weight = gpt_checkpoint
     elif "model" in gpt_checkpoint:  # ddp
@@ -250,7 +254,7 @@ def main(args):
     
     # Prepare models for training:
     if args.gpt_reg_ckpt:
-        checkpoint = torch.load(args.gpt_reg_ckpt, map_location="cpu")
+        checkpoint = torch.load(args.gpt_reg_ckpt, map_location="cpu", weights_only=False)
         gpt_reg_model.load_state_dict(checkpoint["model"], strict=False)
         if args.ema:
             ema.load_state_dict(checkpoint["ema"] if "ema" in checkpoint else checkpoint["model"])
@@ -272,7 +276,7 @@ def main(args):
         
     logger.info(f"Initial state: steps={train_steps}, epochs={start_epoch}")
 
-    steps_per_epoch = len(vis_loader)
+    steps_per_epoch = len(train_loader)
     logger.info(f"Steps per epoch: {steps_per_epoch}")
     total_steps = train_steps + (args.epochs - start_epoch) * steps_per_epoch
     logger.info(f"Total setps: {total_steps}")
@@ -352,7 +356,20 @@ def main(args):
             # # ----------------------------------------------- #
 
             with torch.cuda.amp.autocast(dtype=ptdtype):  
-                _, code_loss, img_loss, ploss, mem_gt_img, fit_img = gpt_reg_model(codes=x, cond_idx=y, mem=mem_gt, targets=x)
+                # _, code_loss, img_loss, ploss, mem_gt_img, fit_img = gpt_reg_model(codes=x, cond_idx=y, mem=mem_gt, targets=x)
+                gen_ar = torch.zeros((b, l, c), dtype=torch.float32, device=device)
+                gen_ar = gen_ar.to(dtype=next(gpt_reg_model.parameters()).dtype)
+                for i in range(l):
+                    gen_ar_logits = gpt_reg_model(gen_ar, cond_idx=y, mem=mem_gt, input_pos=torch.arange(l))
+                    gen_ar[:, i:i+1, :] = gen_ar_logits[:, i:i+1, :]
+            
+            gen_ar_img = gpt_reg_model.fvae.kl.decode(gen_ar.reshape(b, latent_size, latent_size, -1).permute(0, 3, 1, 2).to(torch.float32))
+            gt_img = gpt_reg_model.fvae.kl.decode(x.reshape(b, latent_size, latent_size, -1).permute(0, 3, 1, 2).to(torch.float32))
+            
+            code_loss = F.mse_loss(gen_ar, x)
+            img_loss = F.mse_loss(gen_ar_img, gt_img)
+            ploss = ploss_fn(gen_ar_img, gt_img)
+            
             loss = code_loss + img_loss + ploss
 
             if rank == 0:
@@ -430,7 +447,19 @@ def main(args):
                             mem = x_to_mem(x, gpt_reg_model)
             
                         with torch.cuda.amp.autocast(dtype=ptdtype):  
-                            _, code_loss, img_loss, ploss, _, _ = gpt_reg_model(codes=x, cond_idx=y, mem=mem, input_pos=torch.arange(256), targets=x)
+                            # _, code_loss, img_loss, ploss, _, _ = gpt_reg_model(codes=x, cond_idx=y, mem=mem, input_pos=torch.arange(256), targets=x)
+                            gen_ar = torch.zeros((b, l, c), dtype=torch.float32, device=device)
+                            gen_ar = gen_ar.to(dtype=next(gpt_reg_model.parameters()).dtype)
+                            for i in range(l):
+                                gen_ar_logits = gpt_reg_model(gen_ar, cond_idx=y, mem=mem, input_pos=torch.arange(l))
+                                gen_ar[:, i:i+1, :] = gen_ar_logits[:, i:i+1, :]
+                        gen_ar_img = gpt_reg_model.fvae.kl.decode(gen_ar.reshape(b, latent_size, latent_size, -1).permute(0, 3, 1, 2).to(torch.float32))
+                        gt_img = gpt_reg_model.fvae.kl.decode(x.reshape(b, latent_size, latent_size, -1).permute(0, 3, 1, 2).to(torch.float32))
+            
+                        code_loss = F.mse_loss(gen_ar, x)
+                        img_loss = F.mse_loss(gen_ar_img, gt_img)
+                        ploss = ploss_fn(gen_ar_img, gt_img)
+
                         loss = code_loss + img_loss + ploss
                         total_val_loss += loss.item()
                         total_val_code_loss += code_loss.item()

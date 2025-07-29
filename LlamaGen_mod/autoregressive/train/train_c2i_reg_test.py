@@ -28,6 +28,7 @@ from LlamaGen_mod.utils.ema import update_ema, requires_grad
 from LlamaGen_mod.dataset.build import build_dataset
 from LlamaGen_mod.autoregressive.models.gpt import GPT_models
 from LlamaGen_mod.autoregressive.models.gpt_reg import GPT_Reg_models
+from LlamaGen_mod.autoregressive.models.gpt_fn import GPT_Fn_models
 from LlamaGen_mod.autoregressive.models.generate import generate, generate_continous_code, generate_with_given_tokens
 
 import torch._dynamo
@@ -107,7 +108,7 @@ def main(args):
     # Setup wandb logger
     if rank == 0:
         wandb.login(key="3761ca3994faa9fea7e291585ce72a0ed49562a0")
-        wandb_logger = wandb.init(project="LlamaGen_Reg",
+        wandb_logger = wandb.init(project="LlamaGen_Fn",
                             name=str(datetime.now().strftime('%Y.%m.%d-%H.%M.%S'))+f"rank-{rank}")
 
     # Setup an experiment folder:
@@ -134,12 +135,7 @@ def main(args):
     logger.info(f"{args}")
 
     # training env
-    logger.info(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
-
-    # fvae = FVAE()
-    # ckpt_path = "/mnt/disk3/jinyuan/ckpts/fvae/full/fvae_full_3loss+epoch10.pth"
-    # ckpt = torch.load(ckpt_path)
-    # fvae.load_state_dict(ckpt["model"])    
+    logger.info(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")  
     
     # Setup model
     if args.drop_path_rate > 0.0:
@@ -147,7 +143,7 @@ def main(args):
     else:
         dropout_p = args.dropout_p
     latent_size = args.image_size // args.downsample_size
-    gpt_reg_model = GPT_Reg_models[args.gpt_reg_model](
+    fn_model = GPT_Fn_models[args.gpt_fn_model](
         vocab_size=args.vocab_size,
         block_size=latent_size ** 2,
         num_classes=args.num_classes,
@@ -159,15 +155,15 @@ def main(args):
         token_dropout_p=args.token_dropout_p,
         no_mem=args.no_mem
     ).to(device)
-    logger.info(f"GPT Parameters: {sum(p.numel() for p in gpt_reg_model.parameters()):,}")
+    logger.info(f"GPT Parameters: {sum(p.numel() for p in fn_model.parameters()):,}")
 
     if args.ema:
-        ema = deepcopy(gpt_reg_model).to(device)  # Create an EMA of the model for use after training
+        ema = deepcopy(fn_model).to(device)  # Create an EMA of the model for use after training
         requires_grad(ema, False)
         logger.info(f"EMA Parameters: {sum(p.numel() for p in ema.parameters()):,}")
 
     # Setup optimizer
-    optimizer = creat_optimizer(gpt_reg_model, args.weight_decay, args.lr, (args.beta1, args.beta2), logger)
+    optimizer = creat_optimizer(fn_model, args.weight_decay, args.lr, (args.beta1, args.beta2), logger)
 
     # Setup data:
     # ----------- setup train data -----------
@@ -249,9 +245,9 @@ def main(args):
     
     
     # Prepare models for training:
-    if args.gpt_reg_ckpt:
-        checkpoint = torch.load(args.gpt_reg_ckpt, map_location="cpu", weights_only=False)
-        gpt_reg_model.load_state_dict(checkpoint["model"], strict=False)
+    if args.gpt_fn_ckpt:
+        checkpoint = torch.load(args.gpt_fn_ckpt, map_location="cpu", weights_only=False)
+        fn_model.load_state_dict(checkpoint["model"], strict=False)
         if args.ema:
             ema.load_state_dict(checkpoint["ema"] if "ema" in checkpoint else checkpoint["model"])
         if "optimizer" in checkpoint:
@@ -278,15 +274,15 @@ def main(args):
     logger.info(f"Total setps: {total_steps}")
     
     if args.ema:
-        update_ema(ema, gpt_reg_model, decay=0)  # Ensure EMA is initialized with synced weights
+        update_ema(ema, fn_model, decay=0)  # Ensure EMA is initialized with synced weights
 
     if not args.no_compile:
         logger.info("compiling the model... (may take several minutes)")
         gpt_model = torch.compile(gpt_model)  # requires PyTorch 2.0
-        gpt_reg_model = torch.compile(gpt_reg_model) # requires PyTorch 2.0        
+        fn_model = torch.compile(fn_model) # requires PyTorch 2.0        
     
-    gpt_reg_model = DDP(gpt_reg_model.to(device), device_ids=[args.gpu])
-    gpt_reg_model.train()  # important! This enables embedding dropout for classifier-free guidance
+    fn_model = DDP(fn_model.to(device), device_ids=[args.gpu])
+    fn_model.train()  # important! This enables embedding dropout for classifier-free guidance
     if args.ema:
         ema.eval()  # EMA model should always be in eval mode
 
@@ -318,7 +314,7 @@ def main(args):
                 print("no_mem is True, mem is None")
                 mem_gt = None
             else:
-                mem_gt = x_to_mem(x, gpt_reg_model)  # (B, 256, z_dim=16) -> (B, 256, zq_dim=8)
+                mem_gt = x_to_mem(x, fn_model)  # (B, 256, z_dim=16) -> (B, 256, zq_dim=8)
 
             
             '''
@@ -352,22 +348,22 @@ def main(args):
             # # ----------------------------------------------- #
 
             with torch.cuda.amp.autocast(dtype=ptdtype):  
-                logits, code_loss, img_loss, ploss, mem_gt_img, fit_img = gpt_reg_model(codes=x, cond_idx=y, mem=mem_gt, targets=x)
+                logits, loss = fn_model(input=mem_gt, targets=x)
 
-            logits_prob = F.softmax(logits, dim=-1)
-            gt_prob = F.softmax(x, dim=-1)
-            #print(f"logits_prob.shape: {logits_prob.shape}, gt_prob.shape: {gt_prob.shape}")
-            ce_loss = -torch.sum(gt_prob * torch.log(logits_prob + 1e-8), dim=-1).mean().item()
+            # logits_prob = F.softmax(logits, dim=-1)
+            # gt_prob = F.softmax(x, dim=-1)
+            # #print(f"logits_prob.shape: {logits_prob.shape}, gt_prob.shape: {gt_prob.shape}")
+            # ce_loss = -torch.sum(gt_prob * torch.log(logits_prob + 1e-8), dim=-1).mean().item()
 
-            #loss = code_loss + img_loss + ploss + ce_loss
-            loss = ce_loss + code_loss + img_loss + ploss
+            # #loss = code_loss + img_loss + ploss + ce_loss
+            # loss = ce_loss + img_loss + ploss
 
             if rank == 0:
                 wandb_logger.log({"train_loss": loss.item()}, step=train_steps)
-                wandb_logger.log({"train_code_loss": code_loss.item()}, step=train_steps)
-                wandb_logger.log({"train_img_loss": img_loss.item()}, step=train_steps)
-                wandb_logger.log({"train_ploss": ploss.item()}, step=train_steps)  
-                wandb_logger.log({"train_ce_loss": ce_loss}, step=train_steps)
+                # wandb_logger.log({"train_code_loss": code_loss.item()}, step=train_steps)
+                # wandb_logger.log({"train_img_loss": img_loss.item()}, step=train_steps)
+                # wandb_logger.log({"train_ploss": ploss.item()}, step=train_steps)  
+                # wandb_logger.log({"train_ce_loss": ce_loss}, step=train_steps)
                 # Visualize fitting results
                 # gt_mem_img = gpt_reg_model.module.fvae.vq.decode(mem_gt.reshape(b, 16, 16, -1).permute(0, 3, 1, 2))
                 
@@ -384,14 +380,14 @@ def main(args):
             scaler.scale(loss).backward()
             if args.max_grad_norm != 0.0:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(gpt_reg_model.parameters(), args.max_grad_norm)
+                torch.nn.utils.clip_grad_norm_(fn_model.parameters(), args.max_grad_norm)
             # step the optimizer and scaler if training in fp16
             scaler.step(optimizer)
             scaler.update()
             # flush the gradients as soon as we can, no need for this memory anymore
             optimizer.zero_grad(set_to_none=True)
             if args.ema:
-                update_ema(ema, gpt_reg_model.module._orig_mod if not args.no_compile else gpt_reg_model.module)
+                update_ema(ema, fn_model.module._orig_mod if not args.no_compile else fn_model.module)
 
             # Log loss values:
             running_loss += loss.item()
@@ -420,7 +416,7 @@ def main(args):
             #Evaluation    
             if train_steps % args.val_every == 0 and train_steps > 0:
                 logger.info(f"Begining evaluation at step{train_steps}, epoch{epoch}")
-                gpt_reg_model.eval()
+                fn_model.eval()
                 val_steps = 0
                 total_val_loss = 0.0
                 total_val_code_loss = 0.0
@@ -436,37 +432,37 @@ def main(args):
                             print(f"no_mem is True, mem is set to None")
                             mem = None
                         else:
-                            mem = x_to_mem(x, gpt_reg_model)
+                            mem = x_to_mem(x, fn_model)
             
                         with torch.cuda.amp.autocast(dtype=ptdtype):  
-                            logits, code_loss, img_loss, ploss, _, _ = gpt_reg_model(codes=x, cond_idx=y, mem=mem, input_pos=torch.arange(256), targets=x)
+                            logits, loss = fn_model(input=mem_gt, targets=x)
                         
-                        logits_prob = F.softmax(logits, dim=-1)
-                        gt_prob = F.softmax(x, dim=-1)
-                        ce_loss = -torch.sum(gt_prob * torch.log(logits_prob + 1e-8), dim=-1).mean()
+                        # logits_prob = F.softmax(logits, dim=-1)
+                        # gt_prob = F.softmax(x, dim=-1)
+                        # ce_loss = -torch.sum(gt_prob * torch.log(logits_prob + 1e-8), dim=-1).mean()
                         
-                        #loss = code_loss + img_loss + ploss + ce_loss
-                        loss = ce_loss + code_loss + img_loss + ploss
+                        # #loss = code_loss + img_loss + ploss + ce_loss
+                        # loss = ce_loss + img_loss + ploss
 
                         total_val_loss += loss.item()
-                        total_val_code_loss += code_loss.item()
-                        total_val_img_loss += img_loss.item()
-                        total_val_ploss += ploss.item()
-                        total_ce_loss += ce_loss.item()
+                        # total_val_code_loss += code_loss.item()
+                        # total_val_img_loss += img_loss.item()
+                        # total_val_ploss += ploss.item()
+                        # total_ce_loss += ce_loss.item()
                         val_steps += 1
                     print(f"total_val_loss = {total_val_loss}, val_steps = {val_steps}")
                 avg_val_loss = torch.tensor(total_val_loss / val_steps, device=device)
-                avg_val_code_loss = torch.tensor(total_val_code_loss / val_steps, device=device)
-                avg_val_img_loss = torch.tensor(total_val_img_loss / val_steps, device=device)
-                avg_val_ploss = torch.tensor(total_val_ploss / val_steps, device=device)
-                avg_val_ce_loss = torch.tensor(total_ce_loss / val_steps, device=device)
+                # avg_val_code_loss = torch.tensor(total_val_code_loss / val_steps, device=device)
+                # avg_val_img_loss = torch.tensor(total_val_img_loss / val_steps, device=device)
+                # avg_val_ploss = torch.tensor(total_val_ploss / val_steps, device=device)
+                # avg_val_ce_loss = torch.tensor(total_ce_loss / val_steps, device=device)
                 
                 if rank == 0:
                     wandb_logger.log({"val_loss": avg_val_loss.item()}, step=train_steps)
-                    wandb_logger.log({"val_code_loss": avg_val_code_loss.item()}, step=train_steps)
-                    wandb_logger.log({"val_img_loss": avg_val_img_loss.item()}, step=train_steps)
-                    wandb_logger.log({"val_ploss": avg_val_ploss.item()}, step=train_steps)
-                    wandb_logger.log({"val_ce_loss": avg_val_ce_loss.item()}, step=train_steps)
+                    # wandb_logger.log({"val_code_loss": avg_val_code_loss.item()}, step=train_steps)
+                    # wandb_logger.log({"val_img_loss": avg_val_img_loss.item()}, step=train_steps)
+                    # wandb_logger.log({"val_ploss": avg_val_ploss.item()}, step=train_steps)
+                    # wandb_logger.log({"val_ce_loss": avg_val_ce_loss.item()}, step=train_steps)
                     
                 dist.all_reduce(avg_val_loss, op=dist.ReduceOp.SUM)
                 avg_val_loss = avg_val_loss.item() / dist.get_world_size()
@@ -474,7 +470,7 @@ def main(args):
                 if rank == 0:
                     wandb_logger.log({"total_val_loss": total_val_loss}, step=train_steps)
                     wandb_logger.log({"avg_val_loss": avg_val_loss}, step=train_steps)
-                gpt_reg_model.train()
+                fn_model.train()
                 
             # Visualize fitting result and generation result
             '''
@@ -482,7 +478,7 @@ def main(args):
             '''
             if train_steps % args.vis_every == 0 and train_steps > 0:
                 logger.info(f"Begining visualization at step{train_steps}, epoch{epoch}")
-                gpt_reg_model.eval()
+                fn_model.eval()
                 with torch.no_grad():
                     # Visualize fitting results
                     for x, y in vis_loader:
@@ -492,18 +488,24 @@ def main(args):
                         if args.no_mem==True:
                             mem_gt = None
                         else:
-                            mem_gt = x_to_mem(x, gpt_reg_model) # (b, 256, z_dim=16) -> (b, 256, zq_dim=8)
+                            mem_gt = x_to_mem(x, fn_model) # (b, 256, z_dim=16) -> (b, 256, zq_dim=8)
                         
                         # mem_gt_reshape = mem_gt.reshape(args.vis_num, latent_size, latent_size, -1).permute(0, 3, 1, 2) # (b, 256, z_dim=8) -> (b, z_dim=8, 16, 16)
                         # mem_gt_dec = gpt_reg_model.module.fvae.vq.decode(mem_gt_reshape)
-                        mem_gt_dec = mem_to_img(mem_gt, gpt_reg_model)
+                        mem_gt_dec = mem_to_img(mem_gt, fn_model)
                         mem_gt_grid = make_grid(mem_gt_dec, nrow=args.vis_num, normalize=True, value_range=(-1, 1))
 
-                        z_indices = x.reshape(x.shape[0], -1)# (b, 256)
-                        c_indices = y.reshape(-1)# ([256])
-                        assert z_indices.shape[0] == c_indices.shape[0]
                         with torch.cuda.amp.autocast(dtype=ptdtype):  
-                            _, _, _, _, gt_img, recon_img = gpt_reg_model(codes=x, cond_idx=y, mem=mem_gt, input_pos=torch.arange(256), targets=x)
+                            logits, loss = fn_model(input=mem_gt, targets=x)
+                        
+                        b, l, c = logits.shape
+                        h = w = int(np.sqrt(l))
+
+                        logits_reshaped = logits.reshape(b, h, w, c).permute(0, 3, 1, 2)  # (b, 16, 16, 16)
+                        recon_img = fn_model.module.fvae.kl.decode(logits_reshaped.to(torch.float32))  # (b, 3, 256, 256)
+
+                        gt_reshaped = x.reshape(b, h, w, c).permute(0, 3, 1, 2)  # (b, 16, 16, 16)
+                        gt_img = fn_model.module.fvae.kl.decode(gt_reshaped)  #
                             
                         recon_grid = make_grid(recon_img, nrow=args.vis_num, normalize=True, value_range=(-1, 1))
                         gt_grid = make_grid(gt_img, nrow=args.vis_num, normalize=True, value_range=(-1, 1))
@@ -516,29 +518,6 @@ def main(args):
                             save_image(combined_grid, "/home/guangyi.chen/causal_group/jinyuan.hu/factorizedVAE/factorized_VAE/images/GPT-Reg-fit-res.png")
                         
                         # ++++++++++++++++++ Visualize generation results +++++++++++++++++++++ #
-                        # ------------------ Generate with ground truth memory ------------------- #
-                        c_indices_gen = torch.randint(0, 10, (args.vis_num,), device=device)#换成imagenet时注意把这里的10改成1000（num_classes）
-                        
-                        #print("c_indices_gen.shape:", c_indices_gen.shape)
-                        code_sample = generate_continous_code(
-                            model=gpt_reg_model.module, cond=c_indices_gen, mem=mem_gt, max_new_codes=latent_size ** 2,
-                            cfg_scale=args.cfg_scale, cfg_interval=args.cfg_interval)
-                        
-                        b, l, c = code_sample.shape
-                        h = w = int(np.sqrt(l))
-                                              
-                        code_sample = code_sample.reshape(b, h, w, c).permute(0, 3, 1, 2)  # (b, 16, 16, 16)
-                        img_sample = gpt_reg_model.module.fvae.kl.decode(code_sample)  # (b, 3, 256, 256)
-                        gen_grid1 = make_grid(img_sample, nrow=args.vis_num, normalize=True, value_range=(-1, 1))
-                        
-                        # combined_grid2 = torch.cat((mem_gt_grid, gen_grid1), dim=1)
-                        # combined_image2 = combined_grid2.permute(1, 2, 0).cpu().numpy()
-                        # combined_image2 = (combined_image2 * 255).astype(np.uint8)
-                        
-                        # if rank == 0:
-                        #     wandb_logger.log({"Generation Results": wandb.Image(combined_image2)}, step=train_steps)
-                        # save_image(gen_grid1, "/home/renderex/causal_groups/jinyuan.hu/factorizedVAE/factorized_VAE/images/GPT-Reg-gen-res.png")
-                        # -------------------------------------------------------------------------- #
                         
                         # ------------------- Generate with sampled memory -------------------- #
                         c_indices = torch.randint(0, args.num_classes, (b,), device=device)
@@ -559,25 +538,24 @@ def main(args):
                         #     else:
                         #         break
                         #print("index_sample.shape:", index_sample.shape)
-                        quant_code = gpt_reg_model.module.fvae.vq.quantize.get_codebook_entry(index_sample, shape=(b, 16, 16, 8)) # (b, 8, 16, 16)
+                        quant_code = fn_model.module.fvae.vq.quantize.get_codebook_entry(index_sample, shape=(b, 16, 16, 8)) # (b, 8, 16, 16)
                         # quant_code_dec = gpt_reg_model.module.fvae.vq.decode(quant_code)
                         # mem_gen_grid = make_grid(quant_code_dec, nrow=args.vis_num, normalize=True, value_range=(-1, 1))
                         mem_gen = quant_code.permute(0, 2, 3, 1).reshape(b, latent_size ** 2, -1)  # (b, 256, 8)
-                        mem_gen_dec = mem_to_img(mem_gen, gpt_reg_model)  # (b, 3, 256, 256)
+                        mem_gen_dec = mem_to_img(mem_gen, fn_model)  # (b, 3, 256, 256)
                         mem_gen_grid = make_grid(mem_gen_dec, nrow=args.vis_num, normalize=True, value_range=(-1, 1))
                         
-                        code_sample2 = generate_continous_code(
-                            model=gpt_reg_model.module, cond=c_indices_gen, mem=mem_gen, max_new_codes=latent_size ** 2,
-                            cfg_scale=args.cfg_scale, cfg_interval=args.cfg_interval)
+                        with torch.cuda.amp.autocast(dtype=ptdtype):
+                            logits2 = fn_model(input=mem_gen)
                         
-                        b, l, c = code_sample2.shape
+                        b, l, c = logits2.shape
                         h = w = int(np.sqrt(l))
                                                 
-                        code_sample2 = code_sample2.reshape(b, h, w, c).permute(0, 3, 1, 2)  # (b, 16, 16, 16)
-                        img_sample2 = gpt_reg_model.module.fvae.kl.decode(code_sample2)  # (b, 3, 256, 256)
+                        code_sample2 = logits2.reshape(b, h, w, c).permute(0, 3, 1, 2)  # (b, 16, 16, 16)
+                        img_sample2 = fn_model.module.fvae.kl.decode(code_sample2.to(torch.float32))  # (b, 3, 256, 256)
                         gen_grid2 = make_grid(img_sample2, nrow=args.vis_num, normalize=True, value_range=(-1, 1))
                                                 
-                        combined_grid3 = torch.cat((mem_gt_grid, gen_grid1, mem_gen_grid, gen_grid2), dim=1)
+                        combined_grid3 = torch.cat((mem_gen_grid, gen_grid2), dim=1)
                         combined_image3 = combined_grid3.permute(1, 2, 0).cpu().numpy()
                         combined_image3 = (combined_image3 * 255).astype(np.uint8)
                         #print("l2 gap_between mem_gt and mem_gen:", torch.nn.functional.mse_loss(mem_gt, mem_gen).item())
@@ -590,7 +568,7 @@ def main(args):
                         
                         
                         
-                gpt_reg_model.train()
+                fn_model.train()
                 dist.barrier()
                   
 
@@ -598,9 +576,9 @@ def main(args):
             if train_steps % args.ckpt_every == 0 and train_steps > 0:
                 if rank == 0:
                     if not args.no_compile:
-                        model_weight = gpt_reg_model.module._orig_mod.state_dict()
+                        model_weight = fn_model.module._orig_mod.state_dict()
                     else:
-                        model_weight = gpt_reg_model.module.state_dict()  
+                        model_weight = fn_model.module.state_dict()  
                     checkpoint = {
                         "model": model_weight,
                         "steps": train_steps,
@@ -628,7 +606,7 @@ def main(args):
                 logger.info(f"Reached max training steps: {args.max_steps}. Stopping training.")
                 break
 
-    gpt_reg_model.eval()  # important! This disables randomized embedding dropout
+    fn_model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
 
     logger.info("Done!")
@@ -643,9 +621,9 @@ if __name__ == "__main__":
     parser.add_argument("--cloud-save-path", type=str, required=True, help='please specify a cloud disk path, if not, local path')
     parser.add_argument("--no-local-save", action='store_true', default='False', help='no save checkpoints to local path for limited disk volume')
     parser.add_argument("--gpt-model", type=str, choices=list(GPT_models.keys()), default="GPT-B")
-    parser.add_argument("--gpt-reg-model", type=str, choices=list(GPT_Reg_models.keys()), default="GPT-Reg-B")
+    parser.add_argument("--gpt-fn-model", type=str, choices=list(GPT_Fn_models.keys()), default="GPT-Fn-B")
     parser.add_argument("--gpt-ckpt", type=str, default=None, help="ckpt path for resume training")
-    parser.add_argument("--gpt-reg-ckpt", type=str, default=None)
+    parser.add_argument("--gpt-fn-ckpt", type=str, default=None)
     parser.add_argument("--gpt-type", type=str, choices=['c2i', 't2i'], default="c2i", help="class-conditional or text-conditional")
     parser.add_argument("--vocab-size", type=int, default=16384, help="vocabulary size of visual tokenizer")
     parser.add_argument("--ema", action='store_true', help="whether using ema training")

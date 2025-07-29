@@ -199,9 +199,9 @@ def decode_n_codes(
     cfg_scale: float, cfg_interval: int):
     new_codes = []
     cfg_flag = True
-    print("num_new_codes:", num_new_codes)
-    print("mem.shape:", mem.shape if mem is not None else None)
-    print("input_pos:", input_pos)
+    # print("num_new_codes:", num_new_codes)
+    # print("mem.shape:", mem.shape if mem is not None else None)
+    # print("input_pos:", input_pos)
     for i in range(num_new_codes):
         with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True):
             if cfg_interval > -1 and i > cfg_interval:
@@ -613,8 +613,10 @@ def generate_code_wo_kvcache(model, cond, gt_codes, mem, seq_len=256, emb_masks=
     for i in range(seq_len):
         gen_ar_logits = model(gen_ar, cond_idx=cond, mem=mem, input_pos=torch.arange(seq_len))
         gen_ar[:, i:i+1, :] = gen_ar_logits[:, i:i+1, :]
+
         gen_gt_logits = model(gt_context, cond_idx=cond, mem=mem, input_pos=torch.arange(seq_len))
         gt_context[:, i:i+1, :] = gt_codes[:, i:i+1, :]
+        
         gen_gt[:, i:i+1, :] = gen_gt_logits[:, i:i+1, :]
     # --------------------------------------------------------------------- #
 

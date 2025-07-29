@@ -3,6 +3,8 @@ import torch.nn.functional as F
 from PIL import Image
 import numpy as np
 import lpips  # pip install lpips
+import wandb
+import datetime
 
 def load_image(path, image_size=256):
     img = Image.open(path).convert('RGB')
@@ -19,6 +21,11 @@ def compute_perceptual_loss(img1, img2, loss_fn):
     return loss_fn(img1, img2)
 
 if __name__ == "__main__":
+
+    wandb.login(key="3761ca3994faa9fea7e291585ce72a0ed49562a0")
+    wandb_logger = wandb.init(project="Debug",
+                            name=str(datetime.now().strftime('%Y.%m.%d-%H.%M.%S')))
+    
     path1 = "/home/guangyi.chen/causal_group/jinyuan.hu/factorizedVAE/LlamaGen_mod/samples/GPT-Reg-B-0000100-cfg-2.0-seed-0-debug/000000_gt.png"
     #path2 = "/home/guangyi.chen/causal_group/jinyuan.hu/factorizedVAE/LlamaGen_mod/samples/GPT-Reg-B-0000100-cfg-2.0-seed-0-debug/000000.png"
     #path2 = "/home/guangyi.chen/causal_group/jinyuan.hu/factorizedVAE/LlamaGen_mod/samples/GPT-Reg-B-0000500-cfg-2.0-seed-0-debug/000000.png"

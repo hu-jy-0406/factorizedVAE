@@ -16,24 +16,6 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# class TransformerBlockCrossAtten(TransformerBlock):
-#     def __init__(self, config: ModelArgs, drop_path: float):
-#         super().__init__(config, drop_path)
-        
-#         # self.cross_attn = MultiheadAttention(
-#         #         embed_dim=config.dim,
-#         #         num_heads=config.n_head,
-#         #         dropout=config.attn_dropout_p,
-#         #         batch_first=True,
-#         #         bias=True
-#         #     )
-        
-#     def forward(
-#         self, x: torch.Tensor, mem: torch.Tensor, freqs_cis: torch.Tensor, start_pos: int, mask: Optional[torch.Tensor] = None):
-#         r_sa = self.attention(self.attention_norm(x), freqs_cis, start_pos, mask)
-#         h = x + self.drop_path(r_sa + mem)
-#         out = h + self.drop_path(self.feed_forward(self.ffn_norm(h)))
-#         return out
                 
 class TransformerReg(Transformer):
     def __init__(self, config: ModelArgs):
@@ -60,7 +42,7 @@ class TransformerReg(Transformer):
         #self.cross_attention = CrossAttention(config)
         
         # loss
-        self.mse_loss = MSELoss()
+        self.mse_loss = MSELoss(reduction='mean')
         self.use_perceptual_loss = True  # Use perceptual loss by default
         if self.use_perceptual_loss:
             self.perceptual_loss = LPIPS().eval()
@@ -178,8 +160,8 @@ class TransformerReg(Transformer):
         
             w = int(np.sqrt(l))
 
-            predictions = predictions.reshape(b, w, w, -1).permute(0, 3, 1, 2)
-            pred_dec = self.fvae.kl.decode(predictions)
+            predictions_reshaped = predictions.reshape(b, w, w, -1).permute(0, 3, 1, 2)
+            pred_dec = self.fvae.kl.decode(predictions_reshaped)
 
             
             gt = targets.reshape(b, w, w, -1).permute(0, 3, 1, 2)

@@ -6,7 +6,7 @@ export PYTHONPATH=/home/guangyi.chen/causal_group/jinyuan.hu/factorizedVAE:$PYTH
 export PYTORCH_SYMBOLIC_SHAPES_DISABLE_WARNINGS=1
 export TORCH_DISTRIBUTED_DEBUG=INFO
 
-export WANDB_MODE=disabled
+#export WANDB_MODE=disabled
 
 # torchrun \
 # --nnodes=$nnodes --nproc_per_node=$nproc_per_node --node_rank=$node_rank \
@@ -23,17 +23,20 @@ autoregressive/train/train_c2i_reg.py \
 --image-size 256 \
 --num-classes 10 \
 --cfg-scale 2.0 \
---global-batch-size 2 \
---vis-num 2 \
---epochs 1 \
---log-every 1 \
---vis-every 1 \
---val-every 1 \
---ckpt-every 100000 \
+--global-batch-size 32 \
+--vis-num 8 \
+--epochs 3 \
+--max-step 1000 \
+--log-every 10 \
+--vis-every 100 \
+--val-every 100 \
+--ckpt-every 100 \
 --no-local-save \
+--no-save-optimizer \
 --cloud-save-path /home/guangyi.chen/causal_group/jinyuan.hu/ckpts/LlamaGen/ar_reg/cifar10 \
 --min-ratio 0.3 \
 --gpt-ckpt /home/guangyi.chen/causal_group/jinyuan.hu/ckpts/LlamaGen/ar/cifar10/0002600.pt \
+#--gpt-reg-ckpt /home/guangyi.chen/causal_group/jinyuan.hu/ckpts/LlamaGen/ar_reg/cifar10/2025-07-29-15-25-45/018-GPT-B/checkpoints/0001000.pt
 # --gpt-reg-ckpt /mnt/disk3/jinyuan/ckpts/lamma_gen/test/2025-07-23-17-44-35/046-GPT-Reg-B/checkpoints/0005000.pt
 
 # --gpt-ckpt /mnt/disk3/jinyuan/ckpts/lamma_gen/test/2025-07-23-14-12-26/035-GPT-Reg-B/checkpoints/0001000.pt

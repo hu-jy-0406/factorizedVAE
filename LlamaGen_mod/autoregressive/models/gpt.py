@@ -329,7 +329,8 @@ class TransformerBlock(nn.Module):
         if mem is None:
             h = x + self.drop_path(self.attention(self.attention_norm(x), freqs_cis, start_pos, mask))
         else:
-            h = x + self.drop_path(self.attention(self.attention_norm(x), freqs_cis, start_pos, mask) + mem)
+            #h = x + self.drop_path(self.attention(self.attention_norm(x), freqs_cis, start_pos, mask) + self.test_linear(mem))
+            h = x + self.drop_path(self.attention(self.attention_norm(x+mem), freqs_cis, start_pos, mask))
             
         out = h + self.drop_path(self.feed_forward(self.ffn_norm(h)))
         return out

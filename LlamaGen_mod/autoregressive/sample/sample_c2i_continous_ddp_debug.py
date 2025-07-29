@@ -7,7 +7,7 @@ torch.backends.cudnn.allow_tf32 = True
 import torch.nn.functional as F
 import torch.distributed as dist
 from torch.utils.data import DataLoader, Subset
-from torchvision.utils import save_image
+from torchvision.utils import save_image, make_grid
 
 from tqdm import tqdm
 import os
@@ -15,6 +15,9 @@ from PIL import Image
 import numpy as np
 import math
 import argparse
+import wandb
+import datetime
+import lpips
 
 from LlamaGen_mod.autoregressive.models import gpt_reg
 from LlamaGen_mod.autoregressive.models import gpt
@@ -56,6 +59,7 @@ def create_npz_from_sample_folder(sample_dir, num=50_000):
 
 
 def main(args):
+
     # Setup PyTorch:
     assert torch.cuda.is_available(), "Sampling with DDP requires at least one GPU. sample.py supports CPU-only usage"
     torch.set_grad_enabled(False)
@@ -111,21 +115,23 @@ def main(args):
     print("\n")
     print("args.gpt_reg_ckpt:", args.gpt_reg_ckpt)
     print("\n")
-    gpt_reg_checkpoint = torch.load(args.gpt_reg_ckpt, map_location="cpu", weights_only=False)
-    if args.from_fsdp: # fsdp
-        gpt_reg_model_weight = gpt_reg_checkpoint
-    elif "model" in gpt_reg_checkpoint:  # ddp
-        gpt_reg_model_weight = gpt_reg_checkpoint["model"]
-    elif "module" in gpt_reg_checkpoint: # deepspeed
-        gpt_reg_model_weight = gpt_reg_checkpoint["module"]
-    elif "state_dict" in gpt_reg_checkpoint:
-        gpt_reg_model_weight = gpt_reg_checkpoint["state_dict"]
-    else:
-        raise Exception("please check model weight, maybe add --from-fsdp to run command")
-    gpt_reg_model.load_state_dict(gpt_reg_model_weight, strict=True)
-    print("gpt_reg_model loaded")
-    gpt_reg_model.eval()
-    del gpt_reg_checkpoint   
+
+    if args.gpt_reg_ckpt is not None:
+        gpt_reg_checkpoint = torch.load(args.gpt_reg_ckpt, map_location="cpu", weights_only=False)
+        if args.from_fsdp: # fsdp
+            gpt_reg_model_weight = gpt_reg_checkpoint
+        elif "model" in gpt_reg_checkpoint:  # ddp
+            gpt_reg_model_weight = gpt_reg_checkpoint["model"]
+        elif "module" in gpt_reg_checkpoint: # deepspeed
+            gpt_reg_model_weight = gpt_reg_checkpoint["module"]
+        elif "state_dict" in gpt_reg_checkpoint:
+            gpt_reg_model_weight = gpt_reg_checkpoint["state_dict"]
+        else:
+            raise Exception("please check model weight, maybe add --from-fsdp to run command")
+        gpt_reg_model.load_state_dict(gpt_reg_model_weight, strict=True)
+        print("gpt_reg_model loaded")
+        gpt_reg_model.eval()
+        del gpt_reg_checkpoint   
     
     if args.compile:
         print(f"compiling the model...")
@@ -145,20 +151,26 @@ def main(args):
     # Create folder to save samples:
     model_string_name = args.gpt_reg_model.replace("/", "-")
     print(f"model_string_name: {model_string_name}")
-    if args.from_fsdp:
-        ckpt_string_name = args.gpt_reg_ckpt.split('/')[-2]
+    if args.gpt_reg_ckpt is not None:
+        if args.from_fsdp:
+            ckpt_string_name = args.gpt_reg_ckpt.split('/')[-2]
+        else:
+            ckpt_string_name = os.path.basename(args.gpt_reg_ckpt).replace(".pth", "").replace(".pt", "")
     else:
-        ckpt_string_name = os.path.basename(args.gpt_reg_ckpt).replace(".pth", "").replace(".pt", "")
+        ckpt_string_name = "scratch"
     print(f"ckpt_string_name: {ckpt_string_name}")
-    folder_name = f"{model_string_name}-{ckpt_string_name}-" \
-                  f"cfg-{args.cfg_scale}-seed-{args.global_seed}-{args.info}"
-    print("args.sample_dir:", args.sample_dir)
-    print(f"folder_name: {folder_name}")
-    sample_folder_dir = f"{args.sample_dir}/{folder_name}"
-    print(f"sample_folder_dir: {sample_folder_dir}")
-    if rank == 0:
-        os.makedirs(sample_folder_dir, exist_ok=True)
-        print(f"Saving .png samples at {sample_folder_dir}")
+    # folder_name = f"{model_string_name}-{ckpt_string_name}-" \
+    #               f"cfg-{args.cfg_scale}-seed-{args.global_seed}-{args.info}"
+    # print("args.sample_dir:", args.sample_dir)
+    # print(f"folder_name: {folder_name}")
+    # sample_folder_dir = f"{args.sample_dir}/{folder_name}"
+    # print(f"sample_folder_dir: {sample_folder_dir}")
+    # if rank == 0:
+    #     os.makedirs(sample_folder_dir, exist_ok=True)
+    #     print(f"Saving .png samples at {sample_folder_dir}")
+    wandb.login(key="3761ca3994faa9fea7e291585ce72a0ed49562a0")
+    wandb_logger = wandb.init(project="Debug",
+                            name=f"{model_string_name}-{ckpt_string_name}-{args.info}")
     dist.barrier()
 
     # Figure out how many samples we need to generate on each GPU and how many iterations we need to run:
@@ -216,7 +228,8 @@ def main(args):
         #     cfg_scale=args.cfg_scale, cfg_interval=args.cfg_interval
         # )
         
-        
+        ploss_fn = lpips.LPIPS(net='vgg').to(device)
+
         for x, y in vis_loader:
             x = x.to(device, dtype=precision)
             y = y.to(device, dtype=precision)
@@ -238,36 +251,82 @@ def main(args):
             gt_code = x.reshape(n, latent_size, latent_size, -1).permute(0, 3, 1, 2)  # (b, 16, 16, 16)
             gt_code_dec = fvae.kl.decode(gt_code.to(torch.float32))  # (b, 3, 256, 256)
 
-            for i in range(n):
-                index = i * dist.get_world_size() + rank + total
-                if index < args.num_fid_samples:
-                    save_image(gen_ar_img[i], f"{sample_folder_dir}/{index:06d}_gen_ar.png", normalize=True, value_range=(-1, 1))
-                    save_image(gen_gt_img[i], f"{sample_folder_dir}/{index:06d}_gen_gt.png", normalize=True, value_range=(-1, 1))
-                    save_image(mem_code_dec[i], f"{sample_folder_dir}/{index:06d}_mem.png", normalize=True, value_range=(-1, 1))
-                    save_image(gt_code_dec[i], f"{sample_folder_dir}/{index:06d}_gt.png", normalize=True, value_range=(-1, 1))
-                else:
-                    break
+
+            gt_code_grid = make_grid(gt_code_dec, normalize=True, value_range=(-1, 1), nrow=n)
+            mem_code_grid = make_grid(mem_code_dec, normalize=True, value_range=(-1, 1), nrow=n)
+            gen_gt_grid = make_grid(gen_gt_img, normalize=True, value_range=(-1, 1), nrow=n)
+            gen_ar_grid = make_grid(gen_ar_img, normalize=True, value_range=(-1, 1), nrow=n)
+            combined_grid = torch.cat([gt_code_grid, mem_code_grid, gen_gt_grid, gen_ar_grid], dim=1)
+            combined_image = combined_grid.permute(1, 2, 0).cpu().to(torch.float32).numpy()
+            combined_image = (combined_image * 255).astype(np.uint8)
+            wandb_logger.log({"Reconstruction Comparison": wandb.Image(combined_image)})
+
+            #log images mse loss and ploss
+            wandb_logger.log({
+                "gen_ar_img_mse": F.mse_loss(gen_ar_img, gt_code_dec).item(),
+                "gen_gt_img_mse": F.mse_loss(gen_gt_img, gt_code_dec).item(),
+                "gen_ar_img_ploss": ploss_fn(gen_ar_img, gt_code_dec).mean().item(),
+                "gen_gt_img_ploss": ploss_fn(gen_gt_img, gt_code_dec).mean().item(),
+            })
+            
+
+            # for i in range(n):
+            #     index = i * dist.get_world_size() + rank + total
+            #     if index < args.num_fid_samples:
+            #         save_image(gen_ar_img[i], f"{sample_folder_dir}/{index:06d}_gen_ar.png", normalize=True, value_range=(-1, 1))
+            #         save_image(gen_gt_img[i], f"{sample_folder_dir}/{index:06d}_gen_gt.png", normalize=True, value_range=(-1, 1))
+            #         save_image(mem_code_dec[i], f"{sample_folder_dir}/{index:06d}_mem.png", normalize=True, value_range=(-1, 1))
+            #         save_image(gt_code_dec[i], f"{sample_folder_dir}/{index:06d}_gt.png", normalize=True, value_range=(-1, 1))
+
+            #     else:
+            #         break
 
             # ------------------------------------------------------------------- #
             # calculate the difference between the codes
-            gen_ar_loss = []
-            gen_gt_loss = []
+            # gen_ar_loss = []
+            # gen_gt_loss = []
+
             for i in range(256):
-                gen_ar_loss.append(F.mse_loss(gen_ar_codes[:, i, :], x[:, i, :]).item())
-                gen_gt_loss.append(F.mse_loss(gen_gt_codes[:, i, :], x[:, i, :]).item())
+                
+                # calculate mse
+                # gen_ar_loss.append(F.mse_loss(gen_ar_codes[:, i, :], x[:, i, :]).item())
+                # gen_gt_loss.append(F.mse_loss(gen_gt_codes[:, i, :], x[:, i, :]).item())
+
+                # calculate mse
+                wandb_logger.log({
+                    "gen_ar_mse": F.mse_loss(gen_ar_codes[:, i, :], x[:, i, :]).item(),
+                    "gen_gt_mse": F.mse_loss(gen_gt_codes[:, i, :], x[:, i, :]).item(),
+                }, step=i)
+
+                # calculate l1 loss
+                wandb_logger.log({
+                    "gen_ar_l1": F.l1_loss(gen_ar_codes[:, i, :], x[:, i, :]).item(),
+                    "gen_gt_l1": F.l1_loss(gen_gt_codes[:, i, :], x[:, i, :]).item(),
+                }, step=i)
+
+                # calculate cross entropy
+                gen_ar_prob = F.softmax(gen_ar_codes[:, i, :], dim=-1)
+                gen_gt_prob = F.softmax(gen_gt_codes[:, i, :], dim=-1)
+                gt_prob = F.softmax(x[:, i, :], dim=-1)
+                gen_ar_ce = -torch.sum(gt_prob * gen_ar_prob.log(), dim=-1).mean().item()
+                gen_gt_ce = -torch.sum(gt_prob * gen_gt_prob.log(), dim=-1).mean().item()
+                wandb_logger.log({
+                    "gen_ar_ce": gen_ar_ce,
+                    "gen_gt_ce": gen_gt_ce,
+                }, step=i)
             
-            import matplotlib.pyplot as plt
-            plt.figure(figsize=(10, 6))
-            plt.plot(range(256), gen_ar_loss, label='gen_ar_loss')
-            plt.plot(range(256), gen_gt_loss, label='gen_gt_loss')
-            plt.xlabel('Index')
-            plt.ylabel('MSE Loss')
-            plt.title('Code-wise MSE Loss')
-            plt.legend()
-            plt.grid(True)
-            plt.tight_layout()
-            plt.savefig(f"{sample_folder_dir}/code_loss_curve{model_string_name}-{ckpt_string_name}.png")
-            plt.close()
+            # import matplotlib.pyplot as plt
+            # plt.figure(figsize=(10, 6))
+            # plt.plot(range(256), gen_ar_loss, label='gen_ar_loss')
+            # plt.plot(range(256), gen_gt_loss, label='gen_gt_loss')
+            # plt.xlabel('Index')
+            # plt.ylabel('Loss')
+            # plt.title('Code-wise Loss')
+            # plt.legend()
+            # plt.grid(True)
+            # plt.tight_layout()
+            # plt.savefig(f"{sample_folder_dir}/code_loss_curve{model_string_name}-{ckpt_string_name}.png")
+            # plt.close()
             # ------------------------------------------------------------------- #
 
 
@@ -301,7 +360,7 @@ def main(args):
             #         break
             # ------------------------------------------------------------------- #
             
-        print(f"Rank {rank} saved {n} samples to {sample_folder_dir}. Total samples saved: {total + n}.")
+        #print(f"Rank {rank} saved {n} samples to {sample_folder_dir}. Total samples saved: {total + n}.")
         
         #TODO#
         #change the shape and decode code_sample# 
