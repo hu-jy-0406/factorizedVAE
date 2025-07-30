@@ -1,7 +1,7 @@
 # !/bin/bash
 set -x
 
-export CUDA_VISIBLE_DEVICES=2
+export CUDA_VISIBLE_DEVICES=0
 export PYTHONPATH=/home/guangyi.chen/causal_group/jinyuan.hu/factorizedVAE:$PYTHONPATH
 # export TORCH_LOGS="+dynamo"
 # export TORCHDYNAMO_VERBOSE=1
@@ -12,15 +12,16 @@ torchrun \
 autoregressive/sample/sample_c2i_continous_ddp_debug.py \
 --gpt-model GPT-B \
 --gpt-reg-model GPT-Reg-B \
---gpt-ckpt /home/guangyi.chen/causal_group/jinyuan.hu/ckpts/LlamaGen/ar/cifar10/0002600.pt \
+--gpt-ckpt /home/guangyi.chen/causal_group/jinyuan.hu/ckpts/LlamaGen/ar/cifar10-4img/0001000.pt \
+--gpt-reg-ckpt /home/guangyi.chen/causal_group/jinyuan.hu/ckpts/LlamaGen/ar_reg/cifar10-4img/2025-07-30-10-58-25/041-GPT-B/checkpoints/0001000.pt \
 --image-size 256 \
 --num-classes 10 \
 --cfg-scale 2.0 \
---per-proc-batch-size 10 \
+--per-proc-batch-size 4 \
 --num-fid-samples 4 \
 --sample-dir /home/guangyi.chen/causal_group/jinyuan.hu/factorizedVAE/LlamaGen_mod/samples \
 --no-compile \
---info scratch \
+--info 4img \
 --dataset cifar10_code \
 --train-code-path /home/guangyi.chen/causal_group/jinyuan.hu/CIFAR10-latent/fvae/train \
 --val-code-path /home/guangyi.chen/causal_group/jinyuan.hu/CIFAR10-latent/fvae/val \

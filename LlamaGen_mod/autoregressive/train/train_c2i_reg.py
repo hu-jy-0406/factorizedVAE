@@ -298,11 +298,16 @@ def main(args):
     running_loss = 0
     start_time = time.time()
 
-    
+    reach_max_step = False
+
     logger.info(f"Training for {args.epochs} epochs...")
     for epoch in range(start_epoch, args.epochs):
         train_sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
+
+        # if reach_max_step:
+        #     logger.info(f"Reached max step {args.max_steps}, stopping training.")
+        #     break
         
         # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ #
         # +++++++++++++++++++++++++ Training Loop ++++++++++++++++++++++++++ #
@@ -619,15 +624,20 @@ def main(args):
                         logger.info("Skipping optimizer state saving due to --no-save-optimizer flag.")
                     
                     cloud_checkpoint_path = f"{cloud_checkpoint_dir}/{train_steps:07d}.pt"
+                    os.makedirs(os.path.dirname(cloud_checkpoint_path), exist_ok=True)
                     torch.save(checkpoint, cloud_checkpoint_path)
                     logger.info(f"Saved checkpoint in cloud to {cloud_checkpoint_path}")
                 dist.barrier()
 
             train_steps += 1
-            if train_steps >= args.max_steps:
-                logger.info(f"Reached max training steps: {args.max_steps}. Stopping training.")
-                break
+            # if train_steps >= args.max_steps:
+            #     reach_max_step = True
+            #     logger.info(f"Reached max training steps: {args.max_steps}. Stopping training.")
+            #     break
+            # dist.barrier()  # Ensure all processes are synchronized before the next step
 
+    
+    print(f"Training completed. Total training steps: {train_steps}, epochs: {epoch + 1}")
     gpt_reg_model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
 
@@ -678,7 +688,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--no-mem", action='store_true', default='False', help="whether to use memory projection in the model")
     parser.add_argument("--min-ratio", type=float, default=0.3)
-    parser.add_argument("--max-steps", type=int, default=1000, help="max training steps")
+    parser.add_argument("--max-steps", type=int, default=100000, help="max training steps")
     parser.add_argument("--no-save-optimizer", action='store_true', default=False, help="whether to save optimizer state in checkpoint")
 
     parser.add_argument("--cfg-scale",  type=float, default=1.5)

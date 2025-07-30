@@ -1,12 +1,12 @@
 # !/bin/bash
 set -x
 
-export CUDA_VISIBLE_DEVICES=2
+export CUDA_VISIBLE_DEVICES=0,1
 export PYTHONPATH=/home/guangyi.chen/causal_group/jinyuan.hu/factorizedVAE:$PYTHONPATH
 export PYTORCH_SYMBOLIC_SHAPES_DISABLE_WARNINGS=1
 export TORCH_DISTRIBUTED_DEBUG=INFO
 
-#export WANDB_MODE=disabled
+export WANDB_MODE=disabled
 
 # torchrun \
 # --nnodes=$nnodes --nproc_per_node=$nproc_per_node --node_rank=$node_rank \
@@ -14,7 +14,7 @@ export TORCH_DISTRIBUTED_DEBUG=INFO
 # autoregressive/train/train_c2i.py "$@"
 
 torchrun \
---nnodes=1 --nproc_per_node=1 --node_rank=0 \
+--nnodes=1 --nproc_per_node=2 --node_rank=0 \
 --master_port=12359 \
 autoregressive/train/train_c2i_reg.py \
 --dataset cifar10_code \
@@ -23,19 +23,20 @@ autoregressive/train/train_c2i_reg.py \
 --image-size 256 \
 --num-classes 10 \
 --cfg-scale 2.0 \
---global-batch-size 32 \
+--global-batch-size 64 \
 --vis-num 8 \
---epochs 3 \
---max-step 1000 \
---log-every 10 \
---vis-every 100 \
---val-every 100 \
---ckpt-every 100 \
+--epochs 100 \
+--log-every 100 \
+--vis-every 1000 \
+--val-every 1000 \
+--ckpt-every 1000 \
 --no-local-save \
 --no-save-optimizer \
 --cloud-save-path /home/guangyi.chen/causal_group/jinyuan.hu/ckpts/LlamaGen/ar_reg/cifar10 \
 --min-ratio 0.3 \
 --gpt-ckpt /home/guangyi.chen/causal_group/jinyuan.hu/ckpts/LlamaGen/ar/cifar10/0002600.pt \
+#--gpt-ckpt /home/guangyi.chen/causal_group/jinyuan.hu/ckpts/LlamaGen/ar/cifar10-4img/0001000.pt \
+# --gpt-ckpt /home/guangyi.chen/causal_group/jinyuan.hu/ckpts/LlamaGen/ar/cifar10/0002600.pt \
 #--gpt-reg-ckpt /home/guangyi.chen/causal_group/jinyuan.hu/ckpts/LlamaGen/ar_reg/cifar10/2025-07-29-15-25-45/018-GPT-B/checkpoints/0001000.pt
 # --gpt-reg-ckpt /mnt/disk3/jinyuan/ckpts/lamma_gen/test/2025-07-23-17-44-35/046-GPT-Reg-B/checkpoints/0005000.pt
 
